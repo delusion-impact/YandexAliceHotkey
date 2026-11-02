@@ -1,0 +1,8 @@
+# собранный бинарник (build.ps1)
+*.exe
+*.log
+task_install.log
+
+# служебные файлы
+*.user
+.vs/
