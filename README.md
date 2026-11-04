@@ -64,7 +64,7 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\build.ps1
 Выполните из папки проекта (путь подставляется автоматически):
 
 ```powershell
-Set-Location 'C:\Users\adm\Downloads\YandexAliceHotkey-main'   # ваша папка проекта
+Set-Location 'C:\Users\adm\Documents\YandexAliceHotkey'   # ваша папка проекта
 $exe = (Resolve-Path .\YandexAliceHotkey.exe).Path
 $ws = New-Object -ComObject WScript.Shell
 $lnk = $ws.CreateShortcut("$env:APPDATA\Microsoft\Windows\Start Menu\Programs\Startup\YandexAliceHotkey.lnk")
