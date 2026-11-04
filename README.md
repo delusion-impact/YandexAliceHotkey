@@ -61,12 +61,25 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\build.ps1
 
 Если хотите, чтобы хелпер был запущен всегда (даже до первого старта браузера):
 
+Выполните из папки проекта (путь подставляется автоматически):
+
 ```powershell
+Set-Location 'C:\Users\adm\Downloads\YandexAliceHotkey-main'   # ваша папка проекта
+$exe = (Resolve-Path .\YandexAliceHotkey.exe).Path
 $ws = New-Object -ComObject WScript.Shell
 $lnk = $ws.CreateShortcut("$env:APPDATA\Microsoft\Windows\Start Menu\Programs\Startup\YandexAliceHotkey.lnk")
-$lnk.TargetPath = 'C:\OpenCodeProjects\YandexAliceHotkey\YandexAliceHotkey.exe'
-$lnk.TargetPath += ' --watch'
+$lnk.TargetPath = $exe
+$lnk.Arguments = '--watch'
+$lnk.WorkingDirectory = (Get-Location).Path
 $lnk.Save()
+```
+
+Проверить, что ярлык указывает на существующий файл:
+
+```powershell
+$sh = New-Object -ComObject WScript.Shell
+$lnk = $sh.CreateShortcut("$env:APPDATA\Microsoft\Windows\Start Menu\Programs\Startup\YandexAliceHotkey.lnk")
+Test-Path $lnk.TargetPath   # должно быть True
 ```
 
 Остановить и удалить из автозагрузки:
