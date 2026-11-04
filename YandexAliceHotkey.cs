@@ -404,30 +404,86 @@ namespace YandexAliceHotkey
                 return;
             }
 
+            // Chromium поднимает дерево доступности не сразу: первый вызов может
+            // упасть с E_FAIL ("Нераспознанная ошибка"). Повторяем несколько раз.
             AutomationElement focused = null;
-            try { focused = AutomationElement.FocusedElement; }
-            catch (Exception ex) { Log("decide: FocusedElement failed: " + ex.Message); return; }
-            if (focused == null) { Log("decide: no focused element"); return; }
+            string focusError = null;
+            for (int attempt = 0; attempt < 3 && focused == null; attempt++)
+            {
+                try { focused = AutomationElement.FocusedElement; }
+                catch (Exception ex)
+                {
+                    focusError = ex.Message;
+                    Thread.Sleep(150);
+                }
+            }
+            if (focused == null)
+            {
+                Log("decide: FocusedElement failed: " + focusError);
+                return;
+            }
+
+            string preview;
+            AutomationElement owner;
+            if (TryGetSelection(focused, out preview))
+            {
+                owner = focused;
+                Log("decide: selection found '" + preview + "' -> opening context menu");
+            }
+            else
+            {
+                // Фокус часто не на том документе, где лежит выделение: пользователь
+                // выделяет текст внутри iframe, а активен внешний документ (или
+                // наоборот). Проверяем все документы окна браузера.
+                owner = null;
+                AutomationElementCollection docs = null;
+                try
+                {
+                    docs = AutomationElement.FromHandle(fg).FindAll(TreeScope.Descendants,
+                        new PropertyCondition(AutomationElement.ControlTypeProperty, ControlType.Document));
+                }
+                catch (Exception ex) { Log("decide: document scan failed: " + ex.Message); }
+
+                if (docs != null)
+                {
+                    for (int i = 0; i < docs.Count; i++)
+                    {
+                        if (TryGetSelection(docs[i], out preview))
+                        {
+                            owner = docs[i];
+                            Log("decide: selection found in doc[" + i + "] '" + preview + "'");
+                            break;
+                        }
+                    }
+                }
+
+                if (owner == null)
+                {
+                    Log("decide: " + NoSelectionReason(focused) + ", pass through");
+                    return;
+                }
+            }
+
+            Trigger(fg, owner);
+        }
+
+        // ------------------------------------------------------------------
+        // Выделенный текст элемента (только Document с TextPattern).
+        // ------------------------------------------------------------------
+        private static bool TryGetSelection(AutomationElement element, out string preview)
+        {
+            preview = string.Empty;
+            if (element == null) return false;
 
             ControlType ct;
-            try { ct = focused.Current.ControlType; }
-            catch { return; }
+            try { ct = element.Current.ControlType; }
+            catch { return false; }
 
-            if (!ControlType.Document.Equals(ct))
-            {
-                Log("decide: focus is " + ct.ProgrammaticName + " (not page content), pass through");
-                return;
-            }
+            if (!ControlType.Document.Equals(ct)) return false;
 
             object pattern;
-            if (!focused.TryGetCurrentPattern(TextPattern.Pattern, out pattern))
-            {
-                Log("decide: document exposes no TextPattern, pass through");
-                return;
-            }
+            if (!element.TryGetCurrentPattern(TextPattern.Pattern, out pattern)) return false;
 
-            bool hasSelection = false;
-            string preview = string.Empty;
             try
             {
                 TextPattern tp = (TextPattern)pattern;
@@ -437,38 +493,39 @@ namespace YandexAliceHotkey
                     string text = ranges[i].GetText(80);
                     if (!string.IsNullOrEmpty(text))
                     {
-                        hasSelection = true;
                         preview = text.Replace('\r', ' ').Replace('\n', ' ').Trim();
                         if (preview.Length > 60) preview = preview.Substring(0, 60) + "...";
-                        break;
+                        return true;
                     }
                 }
             }
-            catch (Exception ex)
-            {
-                Log("decide: GetSelection failed: " + ex.Message);
-                return;
-            }
+            catch (Exception ex) { Log("decide: GetSelection failed: " + ex.Message); }
 
-            if (!hasSelection)
-            {
-                Log("decide: selection is empty, pass through");
-                return;
-            }
+            return false;
+        }
 
-            Log("decide: selection found '" + preview + "' -> opening context menu");
-            Trigger(fg);
+        // Причина, по которой выделение не найдено - для лога.
+        private static string NoSelectionReason(AutomationElement focused)
+        {
+            try
+            {
+                ControlType ct = focused.Current.ControlType;
+                if (ControlType.Document.Equals(ct)) return "selection is empty";
+                return "focus is " + ct.ProgrammaticName + " (not page content)";
+            }
+            catch { return "selection is empty"; }
         }
 
         // ------------------------------------------------------------------
         // Открыть контекстное меню и активировать пункт озвучки.
         // ------------------------------------------------------------------
-        private static void Trigger(IntPtr browserWindow)
+        private static void Trigger(IntPtr browserWindow, AutomationElement owner)
         {
             Interlocked.Exchange(ref s_lastTriggerTicks, DateTime.UtcNow.Ticks);
 
             // Shift+F10 открывает контекстное меню для текущего выделения.
             EnsureForeground(browserWindow);
+            FocusOwner(owner);
             SendContextKeys();
 
             AutomationElement window;
@@ -537,6 +594,7 @@ namespace YandexAliceHotkey
                     (DateTime.UtcNow - lastSend).TotalMilliseconds > 900)
                 {
                     EnsureForeground(browserWindow);
+                    FocusOwner(owner);
                     SendContextKeys();
                     sends++;
                     lastSend = DateTime.UtcNow;
@@ -586,6 +644,23 @@ namespace YandexAliceHotkey
                 }
             }
             catch { }
+        }
+
+        // Перевод фокуса в документ, где реально лежит выделение: иначе Shift+F10
+        // откроет меню для постороннего элемента (например, для внешнего
+        // документа, пока выделение внутри iframe).
+        private static void FocusOwner(AutomationElement owner)
+        {
+            if (owner == null) return;
+            try
+            {
+                if (!owner.Current.HasKeyboardFocus)
+                {
+                    owner.SetFocus();
+                    Thread.Sleep(120);
+                }
+            }
+            catch (Exception ex) { Log("trigger: SetFocus failed: " + ex.Message); }
         }
 
         private static bool InvokeItem(AutomationElement item)
