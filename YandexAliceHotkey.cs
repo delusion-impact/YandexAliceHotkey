@@ -41,6 +41,9 @@ namespace YandexAliceHotkey
         private const string WINDOW_CLASS_PREFIX = "Chrome_Yandex_WidgetWin_1";
         private const string BROWSER_PROCESS = "browser";
 
+        // Версия сборки - для сопоставления строк лога с конкретным бинарником.
+        private const string APP_VERSION = "1.2.0";
+
         // Имена пунктов контекстного меню (локализация ru).
         private const string ITEM_SPEAK = "Озвучить Алисой";
         private const string ITEM_STOP = "Остановить воспроизведение";
@@ -48,6 +51,8 @@ namespace YandexAliceHotkey
         private const int DEBOUNCE_MS = 1200;          // защита от автоповтора клавиши
         private const int MENU_TIMEOUT_MS = 3500;      // общее время ожидания меню
         private const int MENU_ITEM_GRACE_MS = 1300;   // доп. ожидание пункта после открытия меню
+        private const int MENU_ATTEMPTS = 3;           // попыток открыть «правильное» меню
+        private const int MENU_RETRY_DELAY_MS = 250;   // пауза между попытками
 
         private delegate IntPtr LowLevelKeyboardProc(int nCode, IntPtr wParam, IntPtr lParam);
 
@@ -218,7 +223,8 @@ namespace YandexAliceHotkey
                 Log("ERROR: SetWindowsHookEx failed, err=" + Marshal.GetLastWin32Error());
                 return false;
             }
-            Log("hook installed; key VK_OEM_3 (` / ё) armed for " + WINDOW_CLASS_PREFIX);
+            Log("hook installed; key VK_OEM_3 (` / ё) armed for " + WINDOW_CLASS_PREFIX +
+                " (v" + APP_VERSION + ")");
             return true;
         }
 
@@ -523,100 +529,138 @@ namespace YandexAliceHotkey
         {
             Interlocked.Exchange(ref s_lastTriggerTicks, DateTime.UtcNow.Ticks);
 
-            // Shift+F10 открывает контекстное меню для текущего выделения.
-            EnsureForeground(browserWindow);
-            FocusOwner(owner);
-            SendContextKeys();
-
             AutomationElement window;
             try { window = AutomationElement.FromHandle(browserWindow); }
             catch (Exception ex) { Log("trigger: FromHandle failed: " + ex.Message); return; }
 
-            DateTime start = DateTime.UtcNow;
-            DateTime lastSend = start;
-            int sends = 1;
-            bool sawMenu = false;
-            DateTime firstMenuSeen = DateTime.MinValue;
-
-            while ((DateTime.UtcNow - start).TotalMilliseconds < MENU_TIMEOUT_MS)
+            // Иногда Shift+F10 открывает «чужое» меню (например, меню самой
+            // страницы без выделения в PDF-просмотрщике) - в нём нет пункта
+            // Алисы. Поэтому не сдаёмся после первой попытки, а закрываем
+            // меню и пробуем ещё раз с полным повтором (FocusOwner + Shift+F10).
+            for (int attempt = 1; attempt <= MENU_ATTEMPTS; attempt++)
             {
-                Thread.Sleep(70);
+                // Shift+F10 открывает контекстное меню для текущего выделения.
+                EnsureForeground(browserWindow);
+                FocusOwner(owner);
+                SendContextKeys();
 
-                AutomationElement speak = null;
-                AutomationElement stop = null;
-                int count = 0;
-                try
+                DateTime start = DateTime.UtcNow;
+                DateTime lastSend = start;
+                int sends = 1;
+                bool sawMenu = false;
+                DateTime firstMenuSeen = DateTime.MinValue;
+                int lastMenuCount = 0;
+                string lastMenuNames = "";
+
+                while ((DateTime.UtcNow - start).TotalMilliseconds < MENU_TIMEOUT_MS)
                 {
-                    AutomationElementCollection items = window.FindAll(
-                        TreeScope.Descendants,
-                        new PropertyCondition(AutomationElement.ControlTypeProperty, ControlType.MenuItem));
-                    count = items.Count;
-                    for (int i = 0; i < items.Count; i++)
+                    Thread.Sleep(70);
+
+                    AutomationElement speak = null;
+                    AutomationElement stop = null;
+                    int count = 0;
+                    StringBuilder names = new StringBuilder();
+                    try
                     {
-                        string name;
-                        try { name = items[i].Current.Name; }
-                        catch { continue; }
-                        if (name.IndexOf(ITEM_SPEAK, StringComparison.Ordinal) >= 0) speak = items[i];
-                        else if (name.IndexOf(ITEM_STOP, StringComparison.Ordinal) >= 0) stop = items[i];
+                        AutomationElementCollection items = window.FindAll(
+                            TreeScope.Descendants,
+                            new PropertyCondition(AutomationElement.ControlTypeProperty, ControlType.MenuItem));
+                        for (int i = 0; i < items.Count; i++)
+                        {
+                            // В дереве доступности есть и постоянных пункты панели
+                            // браузера (скрытые). Считаем только видимые - иначе
+                            // «меню открыто» фиксируется преждевременно.
+                            bool offscreen;
+                            try { offscreen = items[i].Current.IsOffscreen; }
+                            catch { continue; }
+                            if (offscreen) continue;
+
+                            string name;
+                            try { name = items[i].Current.Name; }
+                            catch { continue; }
+
+                            count++;
+                            if (names.Length < 400)
+                            {
+                                if (names.Length > 0) names.Append(" | ");
+                                names.Append(name);
+                            }
+
+                            if (name.IndexOf(ITEM_SPEAK, StringComparison.Ordinal) >= 0) speak = items[i];
+                            else if (name.IndexOf(ITEM_STOP, StringComparison.Ordinal) >= 0) stop = items[i];
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        Log("trigger: menu poll failed: " + ex.Message);
+                        continue;
+                    }
+
+                    if (count > 0)
+                    {
+                        lastMenuCount = count;
+                        lastMenuNames = names.ToString();
+                        if (!sawMenu)
+                        {
+                            sawMenu = true;
+                            firstMenuSeen = DateTime.UtcNow;
+                        }
+                    }
+
+                    AutomationElement target = (speak != null) ? speak : stop;
+                    if (target != null)
+                    {
+                        bool enabled = false;
+                        try { enabled = target.Current.IsEnabled; }
+                        catch { }
+                        if (enabled)
+                        {
+                            string name = "";
+                            try { name = target.Current.Name; }
+                            catch { }
+                            Log("trigger: invoking '" + name + "'");
+                            if (InvokeItem(target)) return;
+                            Log("trigger: invoke failed");
+                        }
+                    }
+
+                    // Меню не появилось - повторяем Shift+F10 (надёжность доставки).
+                    if (!sawMenu && sends < 3 &&
+                        (DateTime.UtcNow - lastSend).TotalMilliseconds > 900)
+                    {
+                        EnsureForeground(browserWindow);
+                        FocusOwner(owner);
+                        SendContextKeys();
+                        sends++;
+                        lastSend = DateTime.UtcNow;
+                        Log("trigger: menu not seen yet, Shift+F10 resend #" + sends);
+                    }
+
+                    if (sawMenu && (DateTime.UtcNow - firstMenuSeen).TotalMilliseconds > MENU_ITEM_GRACE_MS)
+                    {
+                        Log("trigger: attempt " + attempt + "/" + MENU_ATTEMPTS +
+                            ": menu opened (" + lastMenuCount + " items) but the target item is missing: " + lastMenuNames);
+                        SendEscape();
+                        break;
                     }
                 }
-                catch (Exception ex)
+
+                if (attempt < MENU_ATTEMPTS)
                 {
-                    Log("trigger: menu poll failed: " + ex.Message);
+                    Thread.Sleep(MENU_RETRY_DELAY_MS);
+                    Log("trigger: retrying with a fresh Shift+F10 (attempt " + (attempt + 1) + "/" + MENU_ATTEMPTS + ")");
                     continue;
                 }
 
-                if (count > 0 && !sawMenu)
+                if (!sawMenu)
                 {
-                    sawMenu = true;
-                    firstMenuSeen = DateTime.UtcNow;
+                    Log("trigger: context menu did not open (" + sends + " sends)");
                 }
-
-                AutomationElement target = (speak != null) ? speak : stop;
-                if (target != null)
+                else
                 {
-                    bool enabled = false;
-                    try { enabled = target.Current.IsEnabled; }
-                    catch { }
-                    if (enabled)
-                    {
-                        string name = "";
-                        try { name = target.Current.Name; }
-                        catch { }
-                        Log("trigger: invoking '" + name + "'");
-                        if (InvokeItem(target)) return;
-                        Log("trigger: invoke failed");
-                    }
+                    Log("trigger: target item not found after " + MENU_ATTEMPTS + " attempts");
                 }
-
-                // Меню не появилось - повторяем Shift+F10 (надёжность доставки).
-                if (!sawMenu && sends < 3 &&
-                    (DateTime.UtcNow - lastSend).TotalMilliseconds > 900)
-                {
-                    EnsureForeground(browserWindow);
-                    FocusOwner(owner);
-                    SendContextKeys();
-                    sends++;
-                    lastSend = DateTime.UtcNow;
-                    Log("trigger: menu not seen yet, Shift+F10 resend #" + sends);
-                }
-
-                if (sawMenu && (DateTime.UtcNow - firstMenuSeen).TotalMilliseconds > MENU_ITEM_GRACE_MS)
-                {
-                    Log("trigger: menu opened (" + count + " items) but the target item is missing, closing menu");
-                    SendEscape();
-                    return;
-                }
-            }
-
-            if (sawMenu)
-            {
-                Log("trigger: timeout, closing menu");
-                SendEscape();
-            }
-            else
-            {
-                Log("trigger: context menu did not open (" + sends + " sends)");
+                return;
             }
         }
 
