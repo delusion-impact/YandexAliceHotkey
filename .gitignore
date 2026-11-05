@@ -6,3 +6,6 @@ task_install.log
 # служебные файлы
 *.user
 .vs/
+
+# отдельный worktree для публикации
+push-work/

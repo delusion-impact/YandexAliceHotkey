@@ -1,10 +1,10 @@
-# Сборка YandexAliceHotkey-v2.5.11.exe
+# Сборка YandexAliceHotkey-v2.7.0.exe
 $ErrorActionPreference = 'Stop'
 $root = $PSScriptRoot
 if (-not $root) { $root = Split-Path -Parent $MyInvocation.MyCommand.Path }
 
 $src = Join-Path $root 'YandexAliceHotkey.cs'
-$out = Join-Path $root 'YandexAliceHotkey-v2.5.11.exe'
+$out = Join-Path $root 'YandexAliceHotkey-v2.7.0.exe'
 
 # csc читает исходник как ANSI без BOM - пересохраняем в UTF-8 с BOM (кириллица в строках)
 $text = [System.IO.File]::ReadAllText($src, [System.Text.UTF8Encoding]::new($false))
@@ -17,6 +17,7 @@ $refs = @(
     (Join-Path $fw 'WPF\UIAutomationTypes.dll'),
     (Join-Path $fw 'WPF\WindowsBase.dll'),
     (Join-Path $fw 'System.Drawing.dll'),
+    (Join-Path $fw 'System.Windows.Forms.dll'),
     (Join-Path $fw 'System.Runtime.WindowsRuntime.dll'),
     (Join-Path $fw 'System.Runtime.dll')
 )

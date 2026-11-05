@@ -28,13 +28,19 @@ namespace YandexAliceHotkey
     internal static class Program
     {
         private const int WH_KEYBOARD_LL = 13;
+        private const int WH_MOUSE_LL = 14;
         private const int VK_OEM_3 = 0xC0;   // ` (раскладка US) / ё (раскладка RU)
         private const int VK_SHIFT = 0x10;
+        private const int VK_LSHIFT = 0xA0;
         private const int VK_CONTROL = 0x11;
         private const int VK_LCONTROL = 0xA2;
         private const int VK_RCONTROL = 0xA3;
         private const int VK_F10 = 0x79;
         private const int VK_ESCAPE = 0x1B;
+        private const int VK_DOWN = 0x28;
+        private const int VK_UP = 0x26;
+        private const int VK_RIGHT = 0x27;
+        private const int VK_NEXT = 0x22;   // PageDown
 
         private const uint WM_KEYDOWN = 0x0100;
         private const uint WM_KEYUP = 0x0101;
@@ -53,6 +59,15 @@ namespace YandexAliceHotkey
         private const uint PM_REMOVE = 0x0001;
         private const uint QS_ALLINPUT = 0x04FF;
 
+        // Сообщения мыши для низкоуровневого хука: ручное нажатие кнопки или
+        // колесо во время автоматического чтения считается остановкой цикла.
+        private const uint WM_LBUTTONDOWN = 0x0201;
+        private const uint WM_RBUTTONDOWN = 0x0204;
+        private const uint WM_MBUTTONDOWN = 0x0207;
+        private const uint WM_MOUSEWHEEL = 0x020A;
+        private const uint WM_XBUTTONDOWN = 0x020B;
+        private const uint LLMHF_INJECTED = 0x00000001;
+
         private static readonly UIntPtr NO_EXTRA = UIntPtr.Zero;
 
         // Класс главного окна Яндекс Браузера и имя его процесса.
@@ -60,7 +75,7 @@ namespace YandexAliceHotkey
         private const string BROWSER_PROCESS = "browser";
 
         // Версия сборки - для сопоставления строк лога с конкретным бинарником.
-        private const string APP_VERSION = "2.5.11";
+        private const string APP_VERSION = "2.7.0";
         private const int MAX_PAGE_TEXT_CHARS = 12000;
 
         // Имена пунктов контекстного меню (локализация ru).
@@ -73,13 +88,43 @@ namespace YandexAliceHotkey
         private const int MENU_ATTEMPTS = 3;           // попыток открыть «правильное» меню
         private const int MENU_RETRY_DELAY_MS = 250;   // пауза между попытками
 
+        // Ожидание отрисовки страницы: после перелистывания просмотрщик PDF
+        // иногда перерисовывает следующую страницу не сразу, поэтому выделение
+        // может не найти видимую страницу с первой попытки.
+        private const int PAGE_SELECT_ATTEMPTS = 4;
+        private const int PAGE_SELECT_RETRY_DELAY_MS = 900;
+        private const int NOTIFY_TIMEOUT_MS = 6000;
+
+        // Перелистывание. Просмотрщик PDF в Chromium (и в Яндекс Браузере)
+        // листает страницу по ArrowRight / PageDown / Space. Ctrl+стрелка
+        // просмотрщик игнорирует (hasKeyModifiers), поэтому Ctrl+Down только
+        // прокручивает вид примерно на пол-экрана и оставляет лист на границе
+        // двух страниц - именно этот «подвисший на половине» лист и был в логах.
+        // После перелистывания лист доводится до полного попадания в окно
+        // мелкими шагами ArrowDown/ArrowUp (крупный шаг перескакивает страницу).
+        private const double PAGE_TOP_MAX_RATIO = 0.25;      // верх листа не ниже 25% высоты окна
+        private const int PAGE_ALIGN_MAX_STEPS = 14;         // макс. мелких шагов выравнивания
+        private const int PAGE_ALIGN_STEP_DELAY_MS = 220;    // пауза после шага выравнивания
+
         private delegate IntPtr LowLevelKeyboardProc(int nCode, IntPtr wParam, IntPtr lParam);
+
+        private delegate IntPtr LowLevelMouseProc(int nCode, IntPtr wParam, IntPtr lParam);
 
         [StructLayout(LayoutKind.Sequential)]
         private struct KBDLLHOOKSTRUCT
         {
             public uint vkCode;
             public uint scanCode;
+            public uint flags;
+            public uint time;
+            public IntPtr dwExtraInfo;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct MSLLHOOKSTRUCT
+        {
+            public POINT pt;
+            public uint mouseData;
             public uint flags;
             public uint time;
             public IntPtr dwExtraInfo;
@@ -114,6 +159,9 @@ namespace YandexAliceHotkey
 
         [DllImport("user32.dll", SetLastError = true)]
         private static extern IntPtr SetWindowsHookEx(int idHook, LowLevelKeyboardProc lpfn, IntPtr hMod, uint dwThreadId);
+
+        [DllImport("user32.dll", SetLastError = true)]
+        private static extern IntPtr SetWindowsHookEx(int idHook, LowLevelMouseProc lpfn, IntPtr hMod, uint dwThreadId);
 
         [DllImport("user32.dll", SetLastError = true)]
         [return: MarshalAs(UnmanagedType.Bool)]
@@ -178,10 +226,16 @@ namespace YandexAliceHotkey
         private static extern uint MsgWaitForMultipleObjects(uint nCount, IntPtr[] pHandles, bool bWaitAll, uint dwMilliseconds, uint dwWakeMask);
 
         private static IntPtr s_hook;
+        private static IntPtr s_mouseHook;
         private static LowLevelKeyboardProc s_hookProc;
+        private static LowLevelMouseProc s_mouseHookProc;
         private static int s_keyDown;             // 1, пока физически зажата клавиша
         private static int s_ctrlDown;
         private static int s_ctrlAloneCandidate;
+        private static int s_leftShiftDown;
+        private static int s_leftShiftAloneCandidate;
+        private static int s_autoReading;
+        private static int s_autoReadStopRequest; // 1, если пользователь вмешался вручную
         private static int s_busy;                // 1, пока идёт обработка
         private static long s_lastTriggerTicks;   // UtcNow.Ticks последнего запуска
         private static EventWaitHandle s_stopEvent;
@@ -195,6 +249,13 @@ namespace YandexAliceHotkey
         {
             public string Text;
             public System.Windows.Rect Bounds;
+        }
+
+        private enum PlaybackState
+        {
+            Unknown,
+            Playing,
+            Idle
         }
 
         [STAThread]
@@ -296,13 +357,25 @@ namespace YandexAliceHotkey
                 Log("ERROR: SetWindowsHookEx failed, err=" + Marshal.GetLastWin32Error());
                 return false;
             }
+            // Низкоуровневый хук мыши нужен, чтобы во время автоматического
+            // чтения считать ручное вмешательство пользователя остановкой цикла.
+            s_mouseHookProc = MouseHookProc;
+            s_mouseHook = SetWindowsHookEx(WH_MOUSE_LL, s_mouseHookProc, GetModuleHandle(null), 0);
+            if (s_mouseHook == IntPtr.Zero)
+                Log("WARN: mouse hook not installed, err=" + Marshal.GetLastWin32Error());
             Log("hook installed; key VK_OEM_3 (` / ё) armed for " + WINDOW_CLASS_PREFIX +
-                " (v" + APP_VERSION + ")");
+                " (v" + APP_VERSION + "); LShift = auto read cycle");
             return true;
         }
 
         private static void RemoveHook()
         {
+            if (s_mouseHook != IntPtr.Zero)
+            {
+                UnhookWindowsHookEx(s_mouseHook);
+                s_mouseHook = IntPtr.Zero;
+                s_mouseHookProc = null;
+            }
             if (s_hook == IntPtr.Zero) return;
             UnhookWindowsHookEx(s_hook);
             s_hook = IntPtr.Zero;
@@ -401,6 +474,11 @@ namespace YandexAliceHotkey
                         // Ignore keys synthesized by this app while selecting text or opening menus.
                         if ((data.flags & 0x10) != 0) return CallNextHookEx(s_hook, nCode, wParam, lParam);
                         bool isControl = data.vkCode == VK_CONTROL || data.vkCode == VK_LCONTROL || data.vkCode == VK_RCONTROL;
+                        bool isLeftShift = data.vkCode == VK_LSHIFT;
+                        // Любая физическая клавиша во время автоматического
+                        // чтения - это ручное вмешательство: цикл останавливается.
+                        // Сам левый Shift служит штатной остановкой-переключателем.
+                        if (isDown && !isLeftShift) NoteManualActivity("keyboard");
                         if (isControl)
                         {
                             if (isDown && Interlocked.CompareExchange(ref s_ctrlDown, 1, 0) == 0)
@@ -413,9 +491,24 @@ namespace YandexAliceHotkey
                                     StartTrigger(true, "Ctrl");
                             }
                         }
-                        else if (isDown && Interlocked.CompareExchange(ref s_ctrlDown, 0, 0) == 1)
+                        else if (isLeftShift)
                         {
-                            Interlocked.Exchange(ref s_ctrlAloneCandidate, 0);
+                            if (isDown && Interlocked.CompareExchange(ref s_leftShiftDown, 1, 0) == 0)
+                            {
+                                Interlocked.Exchange(ref s_leftShiftAloneCandidate, 1);
+                            }
+                            else if (isUp && Interlocked.Exchange(ref s_leftShiftDown, 0) == 1)
+                            {
+                                if (Interlocked.Exchange(ref s_leftShiftAloneCandidate, 0) == 1)
+                                    ToggleAutoReading();
+                            }
+                        }
+                        else if (isDown)
+                        {
+                            if (Interlocked.CompareExchange(ref s_ctrlDown, 0, 0) == 1)
+                                Interlocked.Exchange(ref s_ctrlAloneCandidate, 0);
+                            if (Interlocked.CompareExchange(ref s_leftShiftDown, 0, 0) == 1)
+                                Interlocked.Exchange(ref s_leftShiftAloneCandidate, 0);
                         }
                         if (data.vkCode == VK_OEM_3)
                         {
@@ -454,6 +547,46 @@ namespace YandexAliceHotkey
             return CallNextHookEx(s_hook, nCode, wParam, lParam);
         }
 
+        // ------------------------------------------------------------------
+        // Low-level mouse hook: ручное нажатие кнопки мыши или колесо во время
+        // автоматического чтения останавливает цикл. Синтезированные этим
+        // приложением события (выделение, контекстное меню) имеют флаг injected
+        // и игнорируются.
+        // ------------------------------------------------------------------
+        private static IntPtr MouseHookProc(int nCode, IntPtr wParam, IntPtr lParam)
+        {
+            try
+            {
+                if (nCode >= 0 && Interlocked.CompareExchange(ref s_autoReading, 0, 0) == 1)
+                {
+                    MSLLHOOKSTRUCT data = (MSLLHOOKSTRUCT)Marshal.PtrToStructure(lParam, typeof(MSLLHOOKSTRUCT));
+                    if ((data.flags & LLMHF_INJECTED) == 0)
+                    {
+                        long m = wParam.ToInt64();
+                        if (m == WM_LBUTTONDOWN || m == WM_RBUTTONDOWN || m == WM_MBUTTONDOWN ||
+                            m == WM_XBUTTONDOWN || m == WM_MOUSEWHEEL)
+                            NoteManualActivity("mouse");
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Log("mouse hook error: " + ex.Message);
+            }
+            return CallNextHookEx(s_mouseHook, nCode, wParam, lParam);
+        }
+
+        // Единая точка «пользователь вмешался вручную». И окончание чтения, и
+        // ручная остановка через меню выглядят одинаково (снова виден пункт
+        // «Озвучить Алисой»), поэтому в автоматическом режиме любое ручное
+        // действие считается остановкой всего цикла, а не переходом дальше.
+        private static void NoteManualActivity(string source)
+        {
+            if (Interlocked.CompareExchange(ref s_autoReading, 0, 0) != 1) return;
+            if (Interlocked.Exchange(ref s_autoReadStopRequest, 1) != 1)
+                Log("auto read: manual activity detected (" + source + "); stopping the cycle");
+        }
+
         private static void StartTrigger(bool bookMode, string keyName)
         {
             IntPtr fg = GetForegroundWindow();
@@ -465,6 +598,245 @@ namespace YandexAliceHotkey
             worker.IsBackground = true;
             worker.SetApartmentState(ApartmentState.STA);
             worker.Start();
+        }
+
+        // Левый Shift запускает или останавливает последовательное чтение PDF.
+        // Повторное одиночное нажатие всегда служит безопасной остановкой цикла.
+        private static void ToggleAutoReading()
+        {
+            if (Interlocked.CompareExchange(ref s_autoReading, 0, 1) == 1)
+            {
+                Interlocked.Exchange(ref s_autoReadStopRequest, 1);
+                Log("auto read: stop requested by Left Shift");
+                return;
+            }
+
+            IntPtr browser = GetForegroundWindow();
+            if (!IsYandexWindow(browser))
+            {
+                Log("auto read: Left Shift ignored because Yandex Browser is not foreground");
+                return;
+            }
+            if (Interlocked.CompareExchange(ref s_busy, 1, 0) != 0)
+            {
+                Log("auto read: Left Shift ignored because another operation is running");
+                return;
+            }
+
+            Interlocked.Exchange(ref s_autoReadStopRequest, 0);
+            Interlocked.Exchange(ref s_autoReading, 1);
+            Log("auto read: started by Left Shift");
+            Thread worker = new Thread(delegate() { AutoReadWorker(browser); });
+            worker.IsBackground = true;
+            worker.SetApartmentState(ApartmentState.STA);
+            worker.Start();
+        }
+
+        // Цикл продолжается только пока не запрошена остановка: её выставляет
+        // либо повторный Left Shift, либо ручное действие пользователя.
+        private static bool IsAutoReading()
+        {
+            if (Interlocked.CompareExchange(ref s_autoReadStopRequest, 0, 0) == 1) return false;
+            return Interlocked.CompareExchange(ref s_autoReading, 0, 0) == 1;
+        }
+
+        // Полный цикл автоматического чтения:
+        //   выделить видимую страницу -> запустить Алису -> дождаться конца
+        //   воспроизведения (по контекстному меню) -> перелистнуть страницу
+        //   (ArrowRight / PageDown) -> выровнять лист в окне -> подтвердить по
+        //   OCR, что страница действительно сменилась -> выделить следующую ->
+        //   повторить.
+        // Любая аварийная остановка сопровождается понятным сообщением, чтобы
+        // режим не выглядел «зависшим».
+        private static void AutoReadWorker(IntPtr browserWindow)
+        {
+            string stopReason = null;   // null => остановка по запросу пользователя
+            try
+            {
+                int page = 0;
+                string previousSignature = null;
+                while (IsAutoReading())
+                {
+                    if (GetForegroundWindow() != browserWindow || !IsYandexWindow(browserWindow))
+                    {
+                        stopReason = "окно Яндекс Браузера перестало быть активным";
+                        break;
+                    }
+
+                    System.Windows.Point? contextPoint;
+                    string signature;
+                    if (!TrySelectPageForAutoRead(browserWindow, out contextPoint, out signature))
+                    {
+                        if (IsAutoReading())
+                        {
+                            stopReason = "не удалось надёжно выделить текст на текущей странице";
+                            LogPageMarker(browserWindow, "could not select page text");
+                        }
+                        break;
+                    }
+
+                    // Подтверждение смены страницы: если после перелистывания
+                    // OCR видит тот же текст, значит страница не сменилась.
+                    // Продолжать нельзя - иначе Алиса повторно прочитает ту же
+                    // страницу.
+                    if (previousSignature != null && signature == previousSignature)
+                    {
+                        stopReason = "текст страницы после перелистывания не изменился " +
+                            "(похоже, достигнут конец документа)";
+                        LogPageMarker(browserWindow, "page text did not change");
+                        break;
+                    }
+                    previousSignature = signature;
+                    if (!IsAutoReading()) break;
+
+                    page++;
+                    Log("auto read: page " + page + " selected; starting playback");
+                    if (!Trigger(browserWindow, null, false, contextPoint))
+                    {
+                        if (IsAutoReading())
+                        {
+                            stopReason = "не удалось запустить озвучку (страница с картинкой или графиком?)";
+                            LogPageMarker(browserWindow, "could not start playback");
+                        }
+                        break;
+                    }
+                    if (!IsAutoReading()) break;
+
+                    bool startedPlaying;
+                    if (!WaitForPlaybackToFinish(browserWindow, contextPoint, out startedPlaying))
+                    {
+                        if (IsAutoReading())
+                        {
+                            if (startedPlaying) stopReason = "озвучка не завершилась (превышено время ожидания)";
+                            else stopReason = "не удалось запустить озвучку (страница с картинкой или графиком?)";
+                            if (!startedPlaying) LogPageMarker(browserWindow, "playback did not start");
+                        }
+                        break;
+                    }
+                    if (!IsAutoReading()) break;
+
+                    ulong before;
+                    if (!TryGetViewportFingerprint(browserWindow, out before))
+                    {
+                        stopReason = "не удалось зафиксировать текущий вид страницы";
+                        break;
+                    }
+                    // ArrowRight - штатная команда «следующая страница» в
+                    // PDF-просмотрщике Chromium. Ctrl+Down страницу не листает,
+                    // а лишь прокручивает вид на пол-экрана.
+                    SendNextPage();
+                    bool viewChanged = WaitForViewportChange(browserWindow, before);
+                    if (!viewChanged && IsAutoReading())
+                    {
+                        // На случай раскладки с горизонтальной прокруткой, где
+                        // ArrowRight не переключает страницу.
+                        Log("auto read: ArrowRight did not change the view; trying PageDown");
+                        SendPageDownKey();
+                        viewChanged = WaitForViewportChange(browserWindow, before);
+                    }
+                    if (!viewChanged)
+                    {
+                        if (IsAutoReading())
+                        {
+                            stopReason = "не удалось перелистнуть страницу " +
+                                "(возможно, достигнут конец документа)";
+                            LogPageMarker(browserWindow, "page turn failed");
+                        }
+                        break;
+                    }
+                    if (!IsAutoReading()) break;
+
+                    // После перелистывания лист может стоять на границе двух
+                    // страниц. Доводим его до полного попадания в окно мелкими
+                    // шагами прокрутки; если белая область листа не найдена
+                    // (страница-картинка), цикл продолжается - выделение ниже
+                    // само отметит страницу в журнале.
+                    PageGeometry geometry = EnsurePageFullyRendered(browserWindow);
+                    if (geometry == PageGeometry.Partial)
+                    {
+                        if (IsAutoReading())
+                        {
+                            stopReason = "страница после перелистывания не вписалась в окно";
+                            LogPageMarker(browserWindow, "page not fully visible");
+                        }
+                        break;
+                    }
+                    Log("auto read: next page turned and aligned");
+                }
+            }
+            catch (Exception ex)
+            {
+                stopReason = "внутренняя ошибка: " + ex.Message;
+                Log("auto read failed: " + ex.Message);
+            }
+            finally
+            {
+                Interlocked.Exchange(ref s_autoReading, 0);
+                Interlocked.Exchange(ref s_autoReadStopRequest, 0);
+                Interlocked.Exchange(ref s_busy, 0);
+                if (stopReason != null)
+                {
+                    // Аварийная остановка: сообщаем пользователю причину,
+                    // чтобы было видно, что цикл завершился, а не завис.
+                    Log("auto read: stopped — " + stopReason);
+                    NotifyUser("Авточтение остановлено", stopReason);
+                }
+                else
+                {
+                    Log("auto read: stopped by user");
+                }
+                Log("auto read: stopped");
+            }
+        }
+
+        // Выделение текущей страницы для цикла: несколько попыток OCR с
+        // паузами (просмотрщик PDF может отрисовывать страницу не мгновенно),
+        // затем резервный путь через UI Automation для страниц, где OCR не
+        // находит белую область (крупные изображения, нестандартный макет).
+        private static bool TrySelectPageForAutoRead(IntPtr browserWindow,
+            out System.Windows.Point? contextPoint, out string signature)
+        {
+            contextPoint = null;
+            signature = null;
+
+            for (int attempt = 1; attempt <= PAGE_SELECT_ATTEMPTS; attempt++)
+            {
+                System.Windows.Point? point;
+                string sig;
+                if (SelectCurrentPageByOcr(browserWindow, out point, out sig))
+                {
+                    contextPoint = point;
+                    signature = sig;
+                    return true;
+                }
+                if (!IsAutoReading()) return false;
+                if (attempt < PAGE_SELECT_ATTEMPTS)
+                {
+                    Log("auto read: page selection attempt " + attempt + "/" + PAGE_SELECT_ATTEMPTS +
+                        " failed; retrying after " + PAGE_SELECT_RETRY_DELAY_MS + " ms");
+                    Thread.Sleep(PAGE_SELECT_RETRY_DELAY_MS);
+                }
+            }
+
+            if (!IsAutoReading()) return false;
+            Log("auto read: OCR could not select the page; falling back to UI Automation");
+            try
+            {
+                AutomationElement focused = null;
+                try { focused = AutomationElement.FocusedElement; }
+                catch { }
+                AutomationElement document = FindFocusedDocument(browserWindow, focused);
+                System.Windows.Point? point;
+                if (document != null && SelectDocumentText(document, browserWindow, out point))
+                {
+                    string preview;
+                    signature = TryGetSelection(document, out preview) ? "uia:" + preview : null;
+                    contextPoint = point;
+                    return true;
+                }
+            }
+            catch (Exception ex) { Log("auto read: UIA fallback failed: " + ex.Message); }
+            return false;
         }
 
         private static bool InDebounce()
@@ -515,7 +887,8 @@ namespace YandexAliceHotkey
             if (bookMode)
             {
                 System.Windows.Point? contextPoint;
-                if (SelectCurrentPageByOcr(fg, out contextPoint))
+                string ignoredSignature;
+                if (SelectCurrentPageByOcr(fg, out contextPoint, out ignoredSignature))
                 {
                     Log("decide: book mode selected the visible page area");
                     if (s_profileOnly) Log("profile mode: skipped opening Alice menu");
@@ -659,9 +1032,11 @@ namespace YandexAliceHotkey
             return null;
         }
 
-        private static bool SelectCurrentPageByOcr(IntPtr browserWindow, out System.Windows.Point? contextPoint)
+        private static bool SelectCurrentPageByOcr(IntPtr browserWindow, out System.Windows.Point? contextPoint,
+            out string pageSignature)
         {
             contextPoint = null;
+            pageSignature = null;
             Stopwatch total = Stopwatch.StartNew();
             Stopwatch phase = Stopwatch.StartNew();
             System.Windows.Rect client;
@@ -735,6 +1110,7 @@ namespace YandexAliceHotkey
 
                         OcrTextLine firstLine = lines[first];
                         OcrTextLine lastLine = lines[last];
+                        pageSignature = MakePageSignature(firstLine.Text, lastLine.Text);
                         double endPadding = Math.Max(8, lastLine.Bounds.Height);
                         System.Windows.Point start = new System.Windows.Point(
                             client.Left + firstLine.Bounds.Left + Math.Min(3, Math.Max(1, firstLine.Bounds.Width * 0.02)),
@@ -775,6 +1151,348 @@ namespace YandexAliceHotkey
                 Log("book OCR failed: " + ex.Message);
                 return false;
             }
+        }
+
+        private static string MakePageSignature(string first, string last)
+        {
+            string a = (first ?? string.Empty).Trim().ToLowerInvariant();
+            string b = (last ?? string.Empty).Trim().ToLowerInvariant();
+            return a + "|" + b;
+        }
+
+        private static bool WaitForPlaybackToFinish(IntPtr browserWindow, System.Windows.Point? contextPoint,
+            out bool startedPlaying)
+        {
+            startedPlaying = false;
+            DateTime started = DateTime.UtcNow;
+            bool seenPlaying = false;
+            int idleConfirmations = 0;
+            while (IsAutoReading())
+            {
+                if (GetForegroundWindow() != browserWindow) return false;
+                PlaybackState state = ReadPlaybackState(browserWindow, contextPoint);
+                if (state == PlaybackState.Playing)
+                {
+                    if (!seenPlaying) Log("auto read: playback confirmed");
+                    seenPlaying = true;
+                    startedPlaying = true;
+                    idleConfirmations = 0;
+                }
+                else if (state == PlaybackState.Idle && seenPlaying)
+                {
+                    idleConfirmations++;
+                    if (idleConfirmations >= 2)
+                    {
+                        Log("auto read: playback finished");
+                        return true;
+                    }
+                }
+
+                // If the command did not enter playback state, do not turn the
+                // page blindly. The user can inspect the log and restart with Shift.
+                if (!seenPlaying && (DateTime.UtcNow - started).TotalSeconds >= 10)
+                    return false;
+                Thread.Sleep(seenPlaying ? 1100 : 550);
+            }
+            return false;
+        }
+
+        private static PlaybackState ReadPlaybackState(IntPtr browserWindow, System.Windows.Point? contextPoint)
+        {
+            if (!contextPoint.HasValue) return PlaybackState.Unknown;
+            uint browserPid;
+            GetWindowThreadProcessId(browserWindow, out browserPid);
+            if (browserPid == 0) return PlaybackState.Unknown;
+
+            EnsureForeground(browserWindow);
+            SendRightClick(browserWindow, contextPoint.Value);
+            try
+            {
+                DateTime limit = DateTime.UtcNow.AddMilliseconds(900);
+                while (DateTime.UtcNow < limit)
+                {
+                    Thread.Sleep(90);
+                    bool sawSpeak = false;
+                    bool sawStop = false;
+                    AutomationElementCollection items = AutomationElement.RootElement.FindAll(
+                        TreeScope.Descendants,
+                        new PropertyCondition(AutomationElement.ControlTypeProperty, ControlType.MenuItem));
+                    for (int i = 0; i < items.Count; i++)
+                    {
+                        int handle = FindOwningWindowHandle(items[i]);
+                        if (handle == 0) continue;
+                        uint itemPid;
+                        GetWindowThreadProcessId(new IntPtr(handle), out itemPid);
+                        if (itemPid != browserPid) continue;
+                        if (items[i].Current.IsOffscreen) continue;
+                        string name = items[i].Current.Name ?? string.Empty;
+                        if (name.IndexOf(ITEM_STOP, StringComparison.Ordinal) >= 0) sawStop = true;
+                        if (name.IndexOf(ITEM_SPEAK, StringComparison.Ordinal) >= 0) sawSpeak = true;
+                    }
+                    if (sawStop) return PlaybackState.Playing;
+                    if (sawSpeak) return PlaybackState.Idle;
+                }
+            }
+            catch (Exception ex) { Log("auto read: playback menu probe failed: " + ex.Message); }
+            finally { SendEscape(); }
+            return PlaybackState.Unknown;
+        }
+
+        // Перелистывание на следующую страницу. В PDF-просмотрщике Chromium
+        // (он же в Яндекс Браузере) ArrowRight вызывает goToNextPage и
+        // сохраняет вертикальное выравнивание листа. Ctrl+стрелки просмотрщик
+        // игнорирует, поэтому Ctrl+Down страницу не листает.
+        private static void SendNextPage()
+        {
+            SendKey(VK_RIGHT);
+        }
+
+        private static void SendPageDownKey()
+        {
+            SendKey(VK_NEXT);
+        }
+
+        // Один мелкий шаг прокрутки вида: ArrowDown/ArrowUp прокручивают
+        // содержимое примерно на 40 px, что позволяет точно вписать лист в окно.
+        private static void ScrollViewport(bool up)
+        {
+            SendKey(up ? VK_UP : VK_DOWN);
+        }
+
+        private static void SendKey(int vk)
+        {
+            keybd_event((byte)vk, 0, 0, NO_EXTRA);
+            Thread.Sleep(30);
+            keybd_event((byte)vk, 0, KEYEVENTF_KEYUP, NO_EXTRA);
+        }
+
+        private enum PageGeometry
+        {
+            Unreadable,   // белая область листа не найдена (напр. страница-картинка)
+            Partial,      // лист найден, но не вписан в окно целиком
+            Full          // лист виден целиком
+        }
+
+        private struct PageView
+        {
+            public PageGeometry Geometry;
+            public double TopOffset;   // верх белой области листа в координатах клиента
+        }
+
+        // Определяет геометрию видимого листа PDF. PageGeometry.Unreadable
+        // означает, что белую область найти не удалось (страница-картинка или
+        // другая нестандартная страница) - в этом случае прокрутка не поможет,
+        // и сведения о странице попадут в маркер журнала.
+        private static PageView DetectPageView(IntPtr browserWindow)
+        {
+            PageView view = new PageView();
+            view.Geometry = PageGeometry.Unreadable;
+
+            System.Windows.Rect client;
+            if (!GetClientScreenBounds(browserWindow, out client) || client.Width < 400 || client.Height < 400)
+                return view;
+
+            System.Windows.Rect pageBounds;
+            try
+            {
+                using (Bitmap bitmap = new Bitmap((int)Math.Round(client.Width), (int)Math.Round(client.Height), PixelFormat.Format32bppArgb))
+                using (Graphics graphics = Graphics.FromImage(bitmap))
+                {
+                    graphics.CopyFromScreen((int)Math.Round(client.Left), (int)Math.Round(client.Top),
+                        0, 0, bitmap.Size, CopyPixelOperation.SourceCopy);
+                    if (!TryFindWhitePageBounds(bitmap, out pageBounds))
+                    {
+                        Log("auto read: page geometry: white page not found");
+                        return view;
+                    }
+                }
+            }
+            catch (Exception ex) { Log("auto read: page geometry capture failed: " + ex.Message); return view; }
+
+            // pageBounds уже в координатах клиентской области (0,0 = левый верх окна).
+            view.TopOffset = pageBounds.Top;
+            bool topAligned = pageBounds.Top >= -2 && pageBounds.Top <= client.Height * PAGE_TOP_MAX_RATIO;
+            bool fullyVisible = pageBounds.Bottom <= client.Height + 2;
+            // Страница выше окна (например, вписанная по ширине) целиком в окно
+            // не поместится - для неё достаточно, чтобы верх листа был на месте.
+            bool tallerThanWindow = pageBounds.Height >= client.Height * 0.9;
+            if (topAligned && (fullyVisible || tallerThanWindow))
+            {
+                view.Geometry = PageGeometry.Full;
+                return view;
+            }
+
+            view.Geometry = PageGeometry.Partial;
+            Log("auto read: page not aligned top=" + pageBounds.Top.ToString("F0") +
+                " bottom=" + pageBounds.Bottom.ToString("F0") +
+                " height=" + pageBounds.Height.ToString("F0") +
+                " clientHeight=" + client.Height.ToString("F0"));
+            return view;
+        }
+
+        // Доводит лист до полного попадания в окно мелкими шагами прокрутки.
+        // После перелистывания лист может стоять на границе двух страниц
+        // (верх листа в середине окна) - тогда прокручиваем вниз, пока он не
+        // впишется целиком. Если верх ушёл за край окна - прокручиваем вверх.
+        private static PageGeometry EnsurePageFullyRendered(IntPtr browserWindow)
+        {
+            PageView view = DetectPageView(browserWindow);
+            int step = 0;
+            while (view.Geometry == PageGeometry.Partial && step < PAGE_ALIGN_MAX_STEPS && IsAutoReading())
+            {
+                step++;
+                ScrollViewport(view.TopOffset < 0);
+                Thread.Sleep(PAGE_ALIGN_STEP_DELAY_MS);
+                view = DetectPageView(browserWindow);
+            }
+            if (view.Geometry == PageGeometry.Full && step > 0)
+                Log("auto read: page aligned to the window in " + step + " scroll step(s)");
+            return view.Geometry;
+        }
+
+        // Номер печатной страницы по видимому листу (для маркера в логе).
+        // Нужен, когда страницу не удалось выделить или запустить озвучку,
+        // чтобы потом улучшить алгоритм разбора таких страниц (графики, схемы).
+        private static string TryDetectVisiblePageNumber(IntPtr browserWindow)
+        {
+            try
+            {
+                System.Windows.Rect client;
+                if (!GetClientScreenBounds(browserWindow, out client) || client.Width < 400 || client.Height < 400)
+                    return null;
+                using (Bitmap bitmap = new Bitmap((int)Math.Round(client.Width), (int)Math.Round(client.Height), PixelFormat.Format32bppArgb))
+                {
+                    using (Graphics graphics = Graphics.FromImage(bitmap))
+                    {
+                        graphics.CopyFromScreen((int)Math.Round(client.Left), (int)Math.Round(client.Top),
+                            0, 0, bitmap.Size, CopyPixelOperation.SourceCopy);
+                    }
+                    System.Windows.Rect pageBounds;
+                    if (!TryFindWhitePageBounds(bitmap, out pageBounds))
+                    {
+                        // На страницах-картинках белой области листа может не быть.
+                        // Для маркера всё равно пытаемся распознать верх/низ окна,
+                        // где обычно стоит номер страницы.
+                        pageBounds = new System.Windows.Rect(0, 0, bitmap.Width, bitmap.Height);
+                    }
+                    OcrEngine engine = GetOcrEngine();
+                    if (engine == null) return null;
+                    using (MemoryStream stream = new MemoryStream())
+                    {
+                        bitmap.Save(stream, ImageFormat.Png);
+                        stream.Position = 0;
+                        IRandomAccessStream randomAccess = stream.AsRandomAccessStream();
+                        BitmapDecoder decoder = BitmapDecoder.CreateAsync(randomAccess).AsTask().GetAwaiter().GetResult();
+                        SoftwareBitmap softwareBitmap = decoder.GetSoftwareBitmapAsync().AsTask().GetAwaiter().GetResult();
+                        OcrResult result = engine.RecognizeAsync(softwareBitmap).AsTask().GetAwaiter().GetResult();
+                        List<OcrTextLine> lines = GetOcrPageLines(result, pageBounds);
+                        string found = DetectFolioFromHeaderOrFooter(lines, pageBounds);
+                        softwareBitmap.Dispose();
+                        randomAccess.Dispose();
+                        return found;
+                    }
+                }
+            }
+            catch (Exception ex) { Log("auto read: page number OCR failed: " + ex.Message); return null; }
+        }
+
+        // Возвращает число страницы (1-4 цифры), если оно стоит в начале или
+        // конце строки колонтитула. Числа в середине строки (годы и т. п.) не
+        // принимаются, чтобы не путать их с номером страницы.
+        private static string TryExtractFolio(string text)
+        {
+            if (string.IsNullOrWhiteSpace(text)) return null;
+            string[] parts = text.Split(
+                new char[] { ' ', '\t', '\u00A0', '\u2003', '|', '.', ',', ';', ':', '—', '–', '-', '/', '(', ')' },
+                StringSplitOptions.RemoveEmptyEntries);
+            if (parts.Length == 0) return null;
+            if (IsPageNumberOnly(parts[0])) return parts[0];
+            if (IsPageNumberOnly(parts[parts.Length - 1])) return parts[parts.Length - 1];
+            return null;
+        }
+
+        // Номер страницы ищется только в верхней и нижней зонах листа, где
+        // обычно стоит колонтитул; так номер не спутать с числами в тексте.
+        private static string DetectFolioFromHeaderOrFooter(List<OcrTextLine> lines, System.Windows.Rect pageBounds)
+        {
+            if (lines == null || lines.Count == 0) return null;
+            double topLimit = pageBounds.Top + pageBounds.Height * 0.10;
+            double bottomLimit = pageBounds.Bottom - pageBounds.Height * 0.10;
+            for (int i = 0; i < lines.Count; i++)
+            {
+                double center = lines[i].Bounds.Top + lines[i].Bounds.Height / 2;
+                if (center <= topLimit || center >= bottomLimit)
+                {
+                    string folio = TryExtractFolio(lines[i].Text);
+                    if (folio != null) return folio;
+                }
+            }
+            return null;
+        }
+
+        private static void LogPageMarker(IntPtr browserWindow, string reason)
+        {
+            string folio = TryDetectVisiblePageNumber(browserWindow);
+            Log("auto read: PAGE MARKER folio=" + (folio ?? "unknown") + " reason='" + reason + "'");
+        }
+
+        private static bool WaitForViewportChange(IntPtr browserWindow, ulong before)
+        {
+            DateTime started = DateTime.UtcNow;
+            ulong candidate = 0;
+            int stableSamples = 0;
+            Thread.Sleep(700); // The PDF viewer often renders the new page asynchronously.
+            while (IsAutoReading() && (DateTime.UtcNow - started).TotalSeconds < 10)
+            {
+                if (GetForegroundWindow() != browserWindow) return false;
+                ulong current;
+                if (TryGetViewportFingerprint(browserWindow, out current) && current != before)
+                {
+                    if (current == candidate) stableSamples++;
+                    else { candidate = current; stableSamples = 1; }
+                    if (stableSamples >= 2) return true;
+                }
+                Thread.Sleep(350);
+            }
+            return false;
+        }
+
+        // A compact visual fingerprint is sufficient here: it waits for PDF
+        // rendering to settle before the next OCR/selection, without OCRing the
+        // page repeatedly while it is still changing.
+        private static bool TryGetViewportFingerprint(IntPtr browserWindow, out ulong fingerprint)
+        {
+            fingerprint = 0;
+            System.Windows.Rect client;
+            if (!GetClientScreenBounds(browserWindow, out client) || client.Width < 400 || client.Height < 400)
+                return false;
+            try
+            {
+                using (Bitmap bitmap = new Bitmap((int)Math.Round(client.Width), (int)Math.Round(client.Height), PixelFormat.Format32bppArgb))
+                using (Graphics graphics = Graphics.FromImage(bitmap))
+                {
+                    graphics.CopyFromScreen((int)Math.Round(client.Left), (int)Math.Round(client.Top),
+                        0, 0, bitmap.Size, CopyPixelOperation.SourceCopy);
+                    ulong hash = 1469598103934665603UL;
+                    const int columns = 24;
+                    const int rows = 30;
+                    int top = Math.Max(0, (int)(bitmap.Height * 0.15));
+                    for (int y = 0; y < rows; y++)
+                    {
+                        int py = top + (bitmap.Height - top - 1) * y / (rows - 1);
+                        for (int x = 0; x < columns; x++)
+                        {
+                            int px = (bitmap.Width - 1) * x / (columns - 1);
+                            Color c = bitmap.GetPixel(px, py);
+                            hash ^= (uint)((c.R >> 4) << 8 | (c.G >> 4) << 4 | (c.B >> 4));
+                            hash *= 1099511628211UL;
+                        }
+                    }
+                    fingerprint = hash;
+                    return true;
+                }
+            }
+            catch (Exception ex) { Log("auto read: viewport capture failed: " + ex.Message); return false; }
         }
 
         private static OcrEngine GetOcrEngine()
@@ -1236,7 +1954,7 @@ namespace YandexAliceHotkey
         // ------------------------------------------------------------------
         // Открыть контекстное меню и активировать пункт озвучки.
         // ------------------------------------------------------------------
-        private static void Trigger(IntPtr browserWindow, AutomationElement owner, bool probeWithoutSelection,
+        private static bool Trigger(IntPtr browserWindow, AutomationElement owner, bool probeWithoutSelection,
             System.Windows.Point? contextPoint = null)
         {
             Interlocked.Exchange(ref s_lastTriggerTicks, DateTime.UtcNow.Ticks);
@@ -1246,7 +1964,7 @@ namespace YandexAliceHotkey
             if (browserPid == 0)
             {
                 Log("trigger: cannot resolve browser process for foreground window");
-                return;
+                return false;
             }
 
             // Иногда Shift+F10 открывает «чужое» меню (например, меню самой
@@ -1387,7 +2105,11 @@ namespace YandexAliceHotkey
                                 Thread.Sleep(250);
                                 continue;
                             }
-                            else if (InvokeItem(target)) return;
+                            else if (InvokeItem(target))
+                            {
+                                // Пункт «Озвучить Алисой» действительно вызван.
+                                return speak != null;
+                            }
                             Log("trigger: invoke failed");
                         }
                     }
@@ -1430,8 +2152,9 @@ namespace YandexAliceHotkey
                 {
                     Log("trigger: target item not found after " + attemptLimit + " attempts");
                 }
-                return;
+                return false;
             }
+            return false;
         }
 
         // UIA children such as Chromium menu items commonly have HWND=0.
@@ -1612,6 +2335,89 @@ namespace YandexAliceHotkey
             StringBuilder sb = new StringBuilder(256);
             if (GetClassName(hwnd, sb, sb.Capacity) == 0) return false;
             return sb.ToString().StartsWith(WINDOW_CLASS_PREFIX, StringComparison.Ordinal);
+        }
+
+        // Всплывающее сообщение в правом нижнем углу экрана. Не забирает фокус
+        // и само закрывается, поэтому не мешает работе в браузере.
+        private sealed class ToastForm : System.Windows.Forms.Form
+        {
+            public ToastForm(string title, string message)
+            {
+                FormBorderStyle = System.Windows.Forms.FormBorderStyle.None;
+                StartPosition = System.Windows.Forms.FormStartPosition.Manual;
+                ShowInTaskbar = false;
+                TopMost = true;
+                BackColor = System.Drawing.Color.FromArgb(32, 32, 32);
+                Size = new System.Drawing.Size(380, 92);
+
+                System.Windows.Forms.Label titleLabel = new System.Windows.Forms.Label();
+                titleLabel.Text = title;
+                titleLabel.ForeColor = System.Drawing.Color.White;
+                titleLabel.Font = new System.Drawing.Font("Segoe UI", 10f, System.Drawing.FontStyle.Bold);
+                titleLabel.AutoSize = false;
+                titleLabel.Location = new System.Drawing.Point(14, 10);
+                titleLabel.Size = new System.Drawing.Size(352, 22);
+                Controls.Add(titleLabel);
+
+                System.Windows.Forms.Label messageLabel = new System.Windows.Forms.Label();
+                messageLabel.Text = message;
+                messageLabel.ForeColor = System.Drawing.Color.Gainsboro;
+                messageLabel.Font = new System.Drawing.Font("Segoe UI", 9f);
+                messageLabel.AutoSize = false;
+                messageLabel.Location = new System.Drawing.Point(14, 34);
+                messageLabel.Size = new System.Drawing.Size(352, 48);
+                Controls.Add(messageLabel);
+
+                System.Windows.Forms.Timer timer = new System.Windows.Forms.Timer();
+                timer.Interval = NOTIFY_TIMEOUT_MS;
+                timer.Tick += delegate(object sender, EventArgs e) { timer.Stop(); Close(); };
+                timer.Start();
+            }
+
+            // Не активировать окно, чтобы не сбивать активное окно браузера.
+            protected override bool ShowWithoutActivation { get { return true; } }
+
+            protected override System.Windows.Forms.CreateParams CreateParams
+            {
+                get
+                {
+                    System.Windows.Forms.CreateParams cp = base.CreateParams;
+                    const int WS_EX_NOACTIVATE = 0x08000000;
+                    const int WS_EX_TOOLWINDOW = 0x00000080;
+                    cp.ExStyle |= WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW;
+                    return cp;
+                }
+            }
+
+            protected override void OnShown(EventArgs e)
+            {
+                base.OnShown(e);
+                System.Drawing.Rectangle work = System.Windows.Forms.Screen.PrimaryScreen.WorkingArea;
+                Location = new System.Drawing.Point(
+                    work.Right - Width - 16, work.Bottom - Height - 16);
+            }
+        }
+
+        private static void NotifyUser(string title, string message)
+        {
+            try
+            {
+                Thread thread = new Thread(delegate()
+                {
+                    try
+                    {
+                        using (ToastForm form = new ToastForm(title, message))
+                        {
+                            System.Windows.Forms.Application.Run(form);
+                        }
+                    }
+                    catch (Exception ex) { Log("notify failed: " + ex.Message); }
+                });
+                thread.IsBackground = true;
+                thread.SetApartmentState(ApartmentState.STA);
+                thread.Start();
+            }
+            catch (Exception ex) { Log("notify failed: " + ex.Message); }
         }
 
         private static void Log(string message)
