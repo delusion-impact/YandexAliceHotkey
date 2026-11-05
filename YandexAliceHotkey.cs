@@ -37,10 +37,6 @@ namespace YandexAliceHotkey
         private const int VK_RCONTROL = 0xA3;
         private const int VK_F10 = 0x79;
         private const int VK_ESCAPE = 0x1B;
-        private const int VK_DOWN = 0x28;
-        private const int VK_UP = 0x26;
-        private const int VK_RIGHT = 0x27;
-        private const int VK_NEXT = 0x22;   // PageDown
 
         private const uint WM_KEYDOWN = 0x0100;
         private const uint WM_KEYUP = 0x0101;
@@ -52,6 +48,7 @@ namespace YandexAliceHotkey
         private const uint MOUSEEVENTF_LEFTDOWN = 0x0002;
         private const uint MOUSEEVENTF_LEFTUP = 0x0004;
         private const uint MOUSEEVENTF_MOVE = 0x0001;
+        private const uint MOUSEEVENTF_WHEEL = 0x0800;
         private const uint MOUSEEVENTF_RIGHTDOWN = 0x0008;
         private const uint MOUSEEVENTF_RIGHTUP = 0x0010;
         private const uint MOUSEEVENTF_VIRTUALDESK = 0x4000;
@@ -75,7 +72,7 @@ namespace YandexAliceHotkey
         private const string BROWSER_PROCESS = "browser";
 
         // Версия сборки - для сопоставления строк лога с конкретным бинарником.
-        private const string APP_VERSION = "2.7.0";
+        private const string APP_VERSION = "2.8.0";
         private const int MAX_PAGE_TEXT_CHARS = 12000;
 
         // Имена пунктов контекстного меню (локализация ru).
@@ -95,16 +92,18 @@ namespace YandexAliceHotkey
         private const int PAGE_SELECT_RETRY_DELAY_MS = 900;
         private const int NOTIFY_TIMEOUT_MS = 6000;
 
-        // Перелистывание. Просмотрщик PDF в Chromium (и в Яндекс Браузере)
-        // листает страницу по ArrowRight / PageDown / Space. Ctrl+стрелка
-        // просмотрщик игнорирует (hasKeyModifiers), поэтому Ctrl+Down только
-        // прокручивает вид примерно на пол-экрана и оставляет лист на границе
-        // двух страниц - именно этот «подвисший на половине» лист и был в логах.
-        // После перелистывания лист доводится до полного попадания в окно
-        // мелкими шагами ArrowDown/ArrowUp (крупный шаг перескакивает страницу).
+        // Перелистывание. Встроенный PDF-просмотрщик не принимает
+        // синтезированные клавиши (ArrowRight/PageDown/ArrowDown до него не
+        // доходят), поэтому вид прокручивается колесом мыши над листом. После
+        // автопрокрутки Алисы лист часто стоит на границе двух страниц:
+        // колесо доводит видимый лист до полного попадания в окно.
         private const double PAGE_TOP_MAX_RATIO = 0.25;      // верх листа не ниже 25% высоты окна
-        private const int PAGE_ALIGN_MAX_STEPS = 14;         // макс. мелких шагов выравнивания
-        private const int PAGE_ALIGN_STEP_DELAY_MS = 220;    // пауза после шага выравнивания
+        private const double PAGE_TOP_MIN_RATIO = 0.10;      // и не выше 10% (иначе лист ушёл вверх)
+        private const int PAGE_ALIGN_MAX_STEPS = 40;         // макс. шагов колеса на выравнивание
+        private const int PAGE_ALIGN_STEP_DELAY_MS = 110;    // пауза после шага колеса
+        private const int PAGE_TURN_ATTEMPTS = 2;            // попыток перелистнуть неизменившуюся страницу
+        private const int WHEEL_COARSE_DELTA = -120;         // один «щелчок» колеса вниз
+        private const int WHEEL_FINE_DELTA = -40;            // мелкий шаг для точного выравнивания
 
         private delegate IntPtr LowLevelKeyboardProc(int nCode, IntPtr wParam, IntPtr lParam);
 
@@ -244,6 +243,9 @@ namespace YandexAliceHotkey
         private static bool s_profileOnly;
         private static OcrEngine s_ocrEngine;
         private static readonly object s_ocrLock = new object();
+        // Высота полностью видимого листа PDF (0 - ещё не измерена). Нужна,
+        // чтобы не принять обрезанный лист за выровненный.
+        private static double s_pageHeightPx;
 
         private sealed class OcrTextLine
         {
@@ -625,6 +627,7 @@ namespace YandexAliceHotkey
 
             Interlocked.Exchange(ref s_autoReadStopRequest, 0);
             Interlocked.Exchange(ref s_autoReading, 1);
+            s_pageHeightPx = 0;   // высота листа измеряется заново в этом сеансе
             Log("auto read: started by Left Shift");
             Thread worker = new Thread(delegate() { AutoReadWorker(browser); });
             worker.IsBackground = true;
@@ -642,10 +645,9 @@ namespace YandexAliceHotkey
 
         // Полный цикл автоматического чтения:
         //   выделить видимую страницу -> запустить Алису -> дождаться конца
-        //   воспроизведения (по контекстному меню) -> перелистнуть страницу
-        //   (ArrowRight / PageDown) -> выровнять лист в окне -> подтвердить по
-        //   OCR, что страница действительно сменилась -> выделить следующую ->
-        //   повторить.
+        //   воспроизведения (по контекстному меню) -> выровнять/перелистнуть
+        //   лист колесом мыши -> подтвердить по OCR, что текст сменился ->
+        //   выделить следующую -> повторить.
         // Любая аварийная остановка сопровождается понятным сообщением, чтобы
         // режим не выглядел «зависшим».
         private static void AutoReadWorker(IntPtr browserWindow)
@@ -655,6 +657,7 @@ namespace YandexAliceHotkey
             {
                 int page = 0;
                 string previousSignature = null;
+                System.Windows.Point? wheelPoint = null;   // точка над листом для колеса мыши
                 while (IsAutoReading())
                 {
                     if (GetForegroundWindow() != browserWindow || !IsYandexWindow(browserWindow))
@@ -662,6 +665,13 @@ namespace YandexAliceHotkey
                         stopReason = "окно Яндекс Браузера перестало быть активным";
                         break;
                     }
+
+                    // После автопрокрутки Алисы лист может стоять на границе
+                    // двух страниц (вид «завис на половине»). Выравниваем
+                    // видимый лист колесом мыши: клавиши до встроенного
+                    // PDF-просмотрщика не доходят.
+                    if (previousSignature != null)
+                        AlignVisiblePage(browserWindow, wheelPoint);
 
                     System.Windows.Point? contextPoint;
                     string signature;
@@ -675,18 +685,35 @@ namespace YandexAliceHotkey
                         break;
                     }
 
-                    // Подтверждение смены страницы: если после перелистывания
-                    // OCR видит тот же текст, значит страница не сменилась.
-                    // Продолжать нельзя - иначе Алиса повторно прочитает ту же
-                    // страницу.
+                    // Если текст тот же, что читали в прошлый раз, просмотрщик
+                    // не перешёл на следующую страницу (Алиса не прокрутила
+                    // вид). Перелистываем колесом и проверяем снова.
                     if (previousSignature != null && signature == previousSignature)
                     {
-                        stopReason = "текст страницы после перелистывания не изменился " +
-                            "(похоже, достигнут конец документа)";
-                        LogPageMarker(browserWindow, "page text did not change");
-                        break;
+                        bool turned = false;
+                        for (int attempt = 1; attempt <= PAGE_TURN_ATTEMPTS && IsAutoReading(); attempt++)
+                        {
+                            Log("auto read: page text unchanged; turning the page by wheel (attempt " +
+                                attempt + "/" + PAGE_TURN_ATTEMPTS + ")");
+                            TurnPageByWheel(browserWindow, contextPoint);
+                            AlignVisiblePage(browserWindow, contextPoint);
+                            if (!TrySelectPageForAutoRead(browserWindow, out contextPoint, out signature))
+                                break;
+                            if (signature != previousSignature) { turned = true; break; }
+                        }
+                        if (!turned)
+                        {
+                            if (IsAutoReading())
+                            {
+                                stopReason = "текст страницы после перелистывания не изменился " +
+                                    "(похоже, достигнут конец документа)";
+                                LogPageMarker(browserWindow, "page text did not change");
+                            }
+                            break;
+                        }
                     }
                     previousSignature = signature;
+                    wheelPoint = contextPoint;
                     if (!IsAutoReading()) break;
 
                     page++;
@@ -713,55 +740,7 @@ namespace YandexAliceHotkey
                         }
                         break;
                     }
-                    if (!IsAutoReading()) break;
-
-                    ulong before;
-                    if (!TryGetViewportFingerprint(browserWindow, out before))
-                    {
-                        stopReason = "не удалось зафиксировать текущий вид страницы";
-                        break;
-                    }
-                    // ArrowRight - штатная команда «следующая страница» в
-                    // PDF-просмотрщике Chromium. Ctrl+Down страницу не листает,
-                    // а лишь прокручивает вид на пол-экрана.
-                    SendNextPage();
-                    bool viewChanged = WaitForViewportChange(browserWindow, before);
-                    if (!viewChanged && IsAutoReading())
-                    {
-                        // На случай раскладки с горизонтальной прокруткой, где
-                        // ArrowRight не переключает страницу.
-                        Log("auto read: ArrowRight did not change the view; trying PageDown");
-                        SendPageDownKey();
-                        viewChanged = WaitForViewportChange(browserWindow, before);
-                    }
-                    if (!viewChanged)
-                    {
-                        if (IsAutoReading())
-                        {
-                            stopReason = "не удалось перелистнуть страницу " +
-                                "(возможно, достигнут конец документа)";
-                            LogPageMarker(browserWindow, "page turn failed");
-                        }
-                        break;
-                    }
-                    if (!IsAutoReading()) break;
-
-                    // После перелистывания лист может стоять на границе двух
-                    // страниц. Доводим его до полного попадания в окно мелкими
-                    // шагами прокрутки; если белая область листа не найдена
-                    // (страница-картинка), цикл продолжается - выделение ниже
-                    // само отметит страницу в журнале.
-                    PageGeometry geometry = EnsurePageFullyRendered(browserWindow);
-                    if (geometry == PageGeometry.Partial)
-                    {
-                        if (IsAutoReading())
-                        {
-                            stopReason = "страница после перелистывания не вписалась в окно";
-                            LogPageMarker(browserWindow, "page not fully visible");
-                        }
-                        break;
-                    }
-                    Log("auto read: next page turned and aligned");
+                    Log("auto read: playback finished; aligning the visible page before the next one");
                 }
             }
             catch (Exception ex)
@@ -1065,6 +1044,7 @@ namespace YandexAliceHotkey
                         return false;
                     }
                     Log("book OCR timing: page bounds=" + pageBounds + " elapsedMs=" + phase.ElapsedMilliseconds);
+                    RememberPageHeight(pageBounds, client.Height);
                     phase.Restart();
 
                     OcrEngine engine = GetOcrEngine();
@@ -1238,32 +1218,38 @@ namespace YandexAliceHotkey
             return PlaybackState.Unknown;
         }
 
-        // Перелистывание на следующую страницу. В PDF-просмотрщике Chromium
-        // (он же в Яндекс Браузере) ArrowRight вызывает goToNextPage и
-        // сохраняет вертикальное выравнивание листа. Ctrl+стрелки просмотрщик
-        // игнорирует, поэтому Ctrl+Down страницу не листает.
-        private static void SendNextPage()
+        // Прокрутка вида колесом мыши. Синтезированные клавиши до встроенного
+        // PDF-просмотрщика не доходят (проверено по журналу: ArrowRight,
+        // PageDown, ArrowDown и Ctrl+Down не сдвигали лист), а мышь работает.
+        private static void SendWheel(System.Windows.Point screenPoint, int delta)
         {
-            SendKey(VK_RIGHT);
+            SetCursorPos((int)Math.Round(screenPoint.X), (int)Math.Round(screenPoint.Y));
+            Thread.Sleep(15);
+            mouse_event(MOUSEEVENTF_WHEEL, 0, 0, delta, NO_EXTRA);
         }
 
-        private static void SendPageDownKey()
+        // Прокручивает вид примерно на один экран вниз (к следующей странице).
+        private static void TurnPageByWheel(IntPtr browserWindow, System.Windows.Point? point)
         {
-            SendKey(VK_NEXT);
-        }
+            System.Windows.Rect client;
+            if (!GetClientScreenBounds(browserWindow, out client) || client.Width < 400 || client.Height < 400)
+                return;
+            EnsureForeground(browserWindow);
+            System.Windows.Point wheelPoint;
+            if (point.HasValue) wheelPoint = point.Value;
+            else wheelPoint = new System.Windows.Point(client.Left + client.Width / 2.0,
+                client.Top + client.Height * 0.6);
 
-        // Один мелкий шаг прокрутки вида: ArrowDown/ArrowUp прокручивают
-        // содержимое примерно на 40 px, что позволяет точно вписать лист в окно.
-        private static void ScrollViewport(bool up)
-        {
-            SendKey(up ? VK_UP : VK_DOWN);
-        }
-
-        private static void SendKey(int vk)
-        {
-            keybd_event((byte)vk, 0, 0, NO_EXTRA);
-            Thread.Sleep(30);
-            keybd_event((byte)vk, 0, KEYEVENTF_KEYUP, NO_EXTRA);
+            // Один «щелчок» колеса прокручивает около 100 px; намеренно берём
+            // меньше высоты листа, чтобы не перескочить страницу - недокрутка
+            // безопасна, её доделает AlignVisiblePage.
+            int notches = Math.Max(3, (int)Math.Ceiling(client.Height * 0.60 / 100.0));
+            for (int i = 0; i < notches && IsAutoReading(); i++)
+            {
+                SendWheel(wheelPoint, WHEEL_COARSE_DELTA);
+                Thread.Sleep(45);
+            }
+            Thread.Sleep(250);
         }
 
         private enum PageGeometry
@@ -1276,13 +1262,30 @@ namespace YandexAliceHotkey
         private struct PageView
         {
             public PageGeometry Geometry;
-            public double TopOffset;   // верх белой области листа в координатах клиента
+            public double TopOffset;      // верх белой области листа в координатах клиента
+            public double BottomOffset;   // низ белой области листа в координатах клиента
+            public double ClientHeight;
         }
 
-        // Определяет геометрию видимого листа PDF. PageGeometry.Unreadable
-        // означает, что белую область найти не удалось (страница-картинка или
-        // другая нестандартная страница) - в этом случае прокрутка не поможет,
-        // и сведения о странице попадут в маркер журнала.
+        // Запоминает высоту полностью видимого листа (низ листа виден и близок
+        // к нижнему краю окна). По ней DetectPageView отличает выровненный лист
+        // от обрезанного: если лист прокручен слишком далеко, его высота падает.
+        private static void RememberPageHeight(System.Windows.Rect pageBounds, double clientHeight)
+        {
+            if (pageBounds.Top >= clientHeight * PAGE_TOP_MIN_RATIO &&
+                pageBounds.Top <= clientHeight * PAGE_TOP_MAX_RATIO &&
+                pageBounds.Bottom < clientHeight - 2 &&
+                pageBounds.Bottom >= clientHeight * 0.90)
+            {
+                s_pageHeightPx = pageBounds.Height;
+            }
+        }
+
+        // Определяет геометрию видимого листа PDF. Полностью видимым лист
+        // считается, когда его верх находится у верхнего края области просмотра
+        // (не ниже 25% высоты окна) и низ доходит до нижнего края окна.
+        // PageGeometry.Unreadable означает, что белую область найти не удалось
+        // (страница-картинка) - прокрутка не поможет, сведения попадут в маркер.
         private static PageView DetectPageView(IntPtr browserWindow)
         {
             PageView view = new PageView();
@@ -1311,43 +1314,86 @@ namespace YandexAliceHotkey
 
             // pageBounds уже в координатах клиентской области (0,0 = левый верх окна).
             view.TopOffset = pageBounds.Top;
-            bool topAligned = pageBounds.Top >= -2 && pageBounds.Top <= client.Height * PAGE_TOP_MAX_RATIO;
-            bool fullyVisible = pageBounds.Bottom <= client.Height + 2;
-            // Страница выше окна (например, вписанная по ширине) целиком в окно
-            // не поместится - для неё достаточно, чтобы верх листа был на месте.
-            bool tallerThanWindow = pageBounds.Height >= client.Height * 0.9;
-            if (topAligned && (fullyVisible || tallerThanWindow))
+            view.BottomOffset = pageBounds.Bottom;
+            view.ClientHeight = client.Height;
+
+            bool topOk = pageBounds.Top >= client.Height * PAGE_TOP_MIN_RATIO &&
+                         pageBounds.Top <= client.Height * PAGE_TOP_MAX_RATIO;
+            // Низ листа должен доходить до нижнего края окна; допуск ~4% высоты
+            // покрывает поля и погрешность распознавания белой области.
+            bool bottomOk = pageBounds.Bottom >= client.Height - client.Height * 0.04;
+            // Если высота полностью видимого листа уже измерена, лист не должен
+            // быть ниже неё: иначе верх или низ страницы обрезан.
+            bool heightOk = s_pageHeightPx <= 0 || pageBounds.Height >= s_pageHeightPx - 8;
+            if (topOk && bottomOk && heightOk)
             {
                 view.Geometry = PageGeometry.Full;
                 return view;
             }
 
             view.Geometry = PageGeometry.Partial;
-            Log("auto read: page not aligned top=" + pageBounds.Top.ToString("F0") +
-                " bottom=" + pageBounds.Bottom.ToString("F0") +
-                " height=" + pageBounds.Height.ToString("F0") +
-                " clientHeight=" + client.Height.ToString("F0"));
             return view;
         }
 
-        // Доводит лист до полного попадания в окно мелкими шагами прокрутки.
-        // После перелистывания лист может стоять на границе двух страниц
-        // (верх листа в середине окна) - тогда прокручиваем вниз, пока он не
-        // впишется целиком. Если верх ушёл за край окна - прокручиваем вверх.
-        private static PageGeometry EnsurePageFullyRendered(IntPtr browserWindow)
+        // Выравнивает видимый лист колесом мыши: прокручивает вниз, пока верх
+        // листа не встанет у верхнего края области просмотра, либо вверх, если
+        // лист уже почти вписан и его низ приподнялся над нижним краем.
+        private static bool AlignVisiblePage(IntPtr browserWindow, System.Windows.Point? point)
         {
-            PageView view = DetectPageView(browserWindow);
-            int step = 0;
-            while (view.Geometry == PageGeometry.Partial && step < PAGE_ALIGN_MAX_STEPS && IsAutoReading())
+            System.Windows.Rect client;
+            if (!GetClientScreenBounds(browserWindow, out client) || client.Width < 400 || client.Height < 400)
+                return false;
+
+            EnsureForeground(browserWindow);
+            System.Windows.Point wheelPoint;
+            if (point.HasValue) wheelPoint = point.Value;
+            else wheelPoint = new System.Windows.Point(client.Left + client.Width / 2.0,
+                client.Top + client.Height * 0.6);
+
+            for (int step = 0; step < PAGE_ALIGN_MAX_STEPS && IsAutoReading(); step++)
             {
-                step++;
-                ScrollViewport(view.TopOffset < 0);
+                PageView view = DetectPageView(browserWindow);
+                if (view.Geometry == PageGeometry.Full)
+                {
+                    // Даём прокрутке «устояться» и проверяем ещё раз, чтобы не
+                    // принять кадр в середине анимации за готовое положение.
+                    Thread.Sleep(250);
+                    PageView confirm = DetectPageView(browserWindow);
+                    if (confirm.Geometry == PageGeometry.Full)
+                    {
+                        if (step > 0) Log("auto read: page aligned to the window in " + step + " wheel step(s)");
+                        return true;
+                    }
+                    view = confirm;
+                }
+                if (view.Geometry == PageGeometry.Unreadable) return false;
+                if (step == 0)
+                    Log("auto read: aligning page top=" + view.TopOffset.ToString("F0") +
+                        " bottom=" + view.BottomOffset.ToString("F0") +
+                        " clientHeight=" + view.ClientHeight.ToString("F0"));
+
+                // Лист почти вписан, но низ приподнялся - прокручиваем вверх
+                // мелкими шагами. Иначе лист ниже окна - прокручиваем вниз.
+                bool scrollUp = view.TopOffset <= client.Height * PAGE_TOP_MAX_RATIO &&
+                                view.BottomOffset >= client.Height * 0.70;
+                int delta = scrollUp ? -WHEEL_FINE_DELTA : WHEEL_COARSE_DELTA;
+                if (!scrollUp && view.TopOffset <= client.Height * 0.35)
+                    delta = WHEEL_FINE_DELTA;   // близко к цели - не перескакиваем
+
+                SendWheel(wheelPoint, delta);
                 Thread.Sleep(PAGE_ALIGN_STEP_DELAY_MS);
-                view = DetectPageView(browserWindow);
             }
-            if (view.Geometry == PageGeometry.Full && step > 0)
-                Log("auto read: page aligned to the window in " + step + " scroll step(s)");
-            return view.Geometry;
+
+            PageView final = DetectPageView(browserWindow);
+            if (final.Geometry == PageGeometry.Full)
+            {
+                Log("auto read: page aligned to the window");
+                return true;
+            }
+            Log("auto read: could not align the page top=" + final.TopOffset.ToString("F0") +
+                " bottom=" + final.BottomOffset.ToString("F0") +
+                " clientHeight=" + final.ClientHeight.ToString("F0"));
+            return false;
         }
 
         // Номер печатной страницы по видимому листу (для маркера в логе).
@@ -1434,65 +1480,6 @@ namespace YandexAliceHotkey
         {
             string folio = TryDetectVisiblePageNumber(browserWindow);
             Log("auto read: PAGE MARKER folio=" + (folio ?? "unknown") + " reason='" + reason + "'");
-        }
-
-        private static bool WaitForViewportChange(IntPtr browserWindow, ulong before)
-        {
-            DateTime started = DateTime.UtcNow;
-            ulong candidate = 0;
-            int stableSamples = 0;
-            Thread.Sleep(700); // The PDF viewer often renders the new page asynchronously.
-            while (IsAutoReading() && (DateTime.UtcNow - started).TotalSeconds < 10)
-            {
-                if (GetForegroundWindow() != browserWindow) return false;
-                ulong current;
-                if (TryGetViewportFingerprint(browserWindow, out current) && current != before)
-                {
-                    if (current == candidate) stableSamples++;
-                    else { candidate = current; stableSamples = 1; }
-                    if (stableSamples >= 2) return true;
-                }
-                Thread.Sleep(350);
-            }
-            return false;
-        }
-
-        // A compact visual fingerprint is sufficient here: it waits for PDF
-        // rendering to settle before the next OCR/selection, without OCRing the
-        // page repeatedly while it is still changing.
-        private static bool TryGetViewportFingerprint(IntPtr browserWindow, out ulong fingerprint)
-        {
-            fingerprint = 0;
-            System.Windows.Rect client;
-            if (!GetClientScreenBounds(browserWindow, out client) || client.Width < 400 || client.Height < 400)
-                return false;
-            try
-            {
-                using (Bitmap bitmap = new Bitmap((int)Math.Round(client.Width), (int)Math.Round(client.Height), PixelFormat.Format32bppArgb))
-                using (Graphics graphics = Graphics.FromImage(bitmap))
-                {
-                    graphics.CopyFromScreen((int)Math.Round(client.Left), (int)Math.Round(client.Top),
-                        0, 0, bitmap.Size, CopyPixelOperation.SourceCopy);
-                    ulong hash = 1469598103934665603UL;
-                    const int columns = 24;
-                    const int rows = 30;
-                    int top = Math.Max(0, (int)(bitmap.Height * 0.15));
-                    for (int y = 0; y < rows; y++)
-                    {
-                        int py = top + (bitmap.Height - top - 1) * y / (rows - 1);
-                        for (int x = 0; x < columns; x++)
-                        {
-                            int px = (bitmap.Width - 1) * x / (columns - 1);
-                            Color c = bitmap.GetPixel(px, py);
-                            hash ^= (uint)((c.R >> 4) << 8 | (c.G >> 4) << 4 | (c.B >> 4));
-                            hash *= 1099511628211UL;
-                        }
-                    }
-                    fingerprint = hash;
-                    return true;
-                }
-            }
-            catch (Exception ex) { Log("auto read: viewport capture failed: " + ex.Message); return false; }
         }
 
         private static OcrEngine GetOcrEngine()
