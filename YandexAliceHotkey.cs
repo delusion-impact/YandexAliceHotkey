@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Diagnostics;
 using System.IO;
 using System.Runtime.InteropServices;
@@ -42,7 +42,7 @@ namespace YandexAliceHotkey
         private const string BROWSER_PROCESS = "browser";
 
         // Версия сборки - для сопоставления строк лога с конкретным бинарником.
-        private const string APP_VERSION = "1.2.0";
+        private const string APP_VERSION = "1.2.5";
 
         // Имена пунктов контекстного меню (локализация ru).
         private const string ITEM_SPEAK = "Озвучить Алисой";
@@ -410,48 +410,43 @@ namespace YandexAliceHotkey
                 return;
             }
 
-            // Chromium поднимает дерево доступности не сразу: первый вызов может
-            // упасть с E_FAIL ("Нераспознанная ошибка"). Повторяем несколько раз.
-            AutomationElement focused = null;
+            // После перезапуска Chromium иногда сначала отдаёт дерево UIA без
+            // выделения. Повторно читаем фокус и документы, чтобы получить
+            // свежие TextPatternRange из обновлённого дерева.
+            const int selectionAttempts = 5;
+            const int selectionRetryDelayMs = 180;
+            AutomationElement owner = null;
+            AutomationElement lastFocused = null;
+            string preview = string.Empty;
             string focusError = null;
-            for (int attempt = 0; attempt < 3 && focused == null; attempt++)
+            int lastDocumentCount = -1;
+            bool foundInFocused = false;
+
+            for (int attempt = 0; attempt < selectionAttempts && owner == null; attempt++)
             {
-                try { focused = AutomationElement.FocusedElement; }
+                try { lastFocused = AutomationElement.FocusedElement; }
                 catch (Exception ex)
                 {
                     focusError = ex.Message;
-                    Thread.Sleep(150);
+                    lastFocused = null;
                 }
-            }
-            if (focused == null)
-            {
-                Log("decide: FocusedElement failed: " + focusError);
-                return;
-            }
 
-            string preview;
-            AutomationElement owner;
-            if (TryGetSelection(focused, out preview))
-            {
-                owner = focused;
-                Log("decide: selection found '" + preview + "' -> opening context menu");
-            }
-            else
-            {
-                // Фокус часто не на том документе, где лежит выделение: пользователь
-                // выделяет текст внутри iframe, а активен внешний документ (или
-                // наоборот). Проверяем все документы окна браузера.
-                owner = null;
-                AutomationElementCollection docs = null;
+                if (lastFocused != null && TryGetSelection(lastFocused, out preview))
+                {
+                    owner = lastFocused;
+                    foundInFocused = true;
+                    break;
+                }
+
+                // Выделение может находиться в iframe/внутреннем Document,
+                // отличном от текущего focused element. Каждый раз перечитываем
+                // браузерное UIA дерево, а не используем ранее сохранённый список.
                 try
                 {
-                    docs = AutomationElement.FromHandle(fg).FindAll(TreeScope.Descendants,
+                    AutomationElement root = AutomationElement.FromHandle(fg);
+                    AutomationElementCollection docs = root.FindAll(TreeScope.Descendants,
                         new PropertyCondition(AutomationElement.ControlTypeProperty, ControlType.Document));
-                }
-                catch (Exception ex) { Log("decide: document scan failed: " + ex.Message); }
-
-                if (docs != null)
-                {
+                    lastDocumentCount = docs.Count;
                     for (int i = 0; i < docs.Count; i++)
                     {
                         if (TryGetSelection(docs[i], out preview))
@@ -462,15 +457,43 @@ namespace YandexAliceHotkey
                         }
                     }
                 }
+                catch (Exception ex) { Log("decide: document scan failed: " + ex.Message); }
 
-                if (owner == null)
-                {
-                    Log("decide: " + NoSelectionReason(focused) + ", pass through");
-                    return;
-                }
+                if (owner == null && attempt + 1 < selectionAttempts)
+                    Thread.Sleep(selectionRetryDelayMs);
             }
 
-            Trigger(fg, owner);
+            if (owner == null)
+            {
+                string reason = lastFocused == null
+                    ? "FocusedElement unavailable: " + (focusError ?? "no element")
+                    : NoSelectionReason(lastFocused);
+                Log("decide: no selection after " + selectionAttempts +
+                    " fresh UIA scans (documents=" + lastDocumentCount + ", " + reason + "), pass through");
+
+                // The built-in PDF viewer can visibly select text while exposing
+                // an empty TextPattern selection. For a focused Document only,
+                // use the context menu itself as the selection check: the Alice
+                // action is invoked only if the selected-text menu item exists.
+                if (IsDocumentElement(lastFocused))
+                {
+                    Log("decide: probing PDF context menu because UIA selection is unavailable");
+                    Trigger(fg, lastFocused, true);
+                }
+                return;
+            }
+
+            if (foundInFocused)
+                Log("decide: selection found '" + preview + "' -> opening context menu");
+
+            Trigger(fg, owner, false);
+        }
+
+        private static bool IsDocumentElement(AutomationElement element)
+        {
+            if (element == null) return false;
+            try { return ControlType.Document.Equals(element.Current.ControlType); }
+            catch { return false; }
         }
 
         // ------------------------------------------------------------------
@@ -525,19 +548,25 @@ namespace YandexAliceHotkey
         // ------------------------------------------------------------------
         // Открыть контекстное меню и активировать пункт озвучки.
         // ------------------------------------------------------------------
-        private static void Trigger(IntPtr browserWindow, AutomationElement owner)
+        private static void Trigger(IntPtr browserWindow, AutomationElement owner, bool probeWithoutSelection)
         {
             Interlocked.Exchange(ref s_lastTriggerTicks, DateTime.UtcNow.Ticks);
 
-            AutomationElement window;
-            try { window = AutomationElement.FromHandle(browserWindow); }
-            catch (Exception ex) { Log("trigger: FromHandle failed: " + ex.Message); return; }
+            uint browserPid;
+            GetWindowThreadProcessId(browserWindow, out browserPid);
+            if (browserPid == 0)
+            {
+                Log("trigger: cannot resolve browser process for foreground window");
+                return;
+            }
 
             // Иногда Shift+F10 открывает «чужое» меню (например, меню самой
             // страницы без выделения в PDF-просмотрщике) - в нём нет пункта
             // Алисы. Поэтому не сдаёмся после первой попытки, а закрываем
             // меню и пробуем ещё раз с полным повтором (FocusOwner + Shift+F10).
-            for (int attempt = 1; attempt <= MENU_ATTEMPTS; attempt++)
+            int attemptLimit = probeWithoutSelection ? 1 : MENU_ATTEMPTS;
+            int timeoutMs = probeWithoutSelection ? 2200 : MENU_TIMEOUT_MS;
+            for (int attempt = 1; attempt <= attemptLimit; attempt++)
             {
                 // Shift+F10 открывает контекстное меню для текущего выделения.
                 EnsureForeground(browserWindow);
@@ -551,8 +580,9 @@ namespace YandexAliceHotkey
                 DateTime firstMenuSeen = DateTime.MinValue;
                 int lastMenuCount = 0;
                 string lastMenuNames = "";
+                bool loggedUiADiagnostics = false;
 
-                while ((DateTime.UtcNow - start).TotalMilliseconds < MENU_TIMEOUT_MS)
+                while ((DateTime.UtcNow - start).TotalMilliseconds < timeoutMs)
                 {
                     Thread.Sleep(70);
 
@@ -562,11 +592,28 @@ namespace YandexAliceHotkey
                     StringBuilder names = new StringBuilder();
                     try
                     {
-                        AutomationElementCollection items = window.FindAll(
+                        // Контекстное меню Chromium в некоторых версиях Яндекс
+                        // Браузера публикуется отдельным popup HWND и не является
+                        // потомком главного окна в UIA-дереве. Ищем MenuItem на
+                        // рабочем столе, затем оставляем только элементы окон
+                        // процесса browser, чтобы не принять меню другого приложения.
+                        AutomationElementCollection items = AutomationElement.RootElement.FindAll(
                             TreeScope.Descendants,
                             new PropertyCondition(AutomationElement.ControlTypeProperty, ControlType.MenuItem));
+                        int withHandle = 0;
+                        int sameProcess = 0;
+                        int visibleForProcess = 0;
                         for (int i = 0; i < items.Count; i++)
                         {
+                            int nativeHandle = FindOwningWindowHandle(items[i]);
+                            if (nativeHandle == 0) continue;
+                            withHandle++;
+
+                            uint itemProcessId;
+                            GetWindowThreadProcessId(new IntPtr(nativeHandle), out itemProcessId);
+                            if (itemProcessId != browserPid) continue;
+                            sameProcess++;
+
                             // В дереве доступности есть и постоянных пункты панели
                             // браузера (скрытые). Считаем только видимые - иначе
                             // «меню открыто» фиксируется преждевременно.
@@ -574,6 +621,7 @@ namespace YandexAliceHotkey
                             try { offscreen = items[i].Current.IsOffscreen; }
                             catch { continue; }
                             if (offscreen) continue;
+                            visibleForProcess++;
 
                             string name;
                             try { name = items[i].Current.Name; }
@@ -588,6 +636,13 @@ namespace YandexAliceHotkey
 
                             if (name.IndexOf(ITEM_SPEAK, StringComparison.Ordinal) >= 0) speak = items[i];
                             else if (name.IndexOf(ITEM_STOP, StringComparison.Ordinal) >= 0) stop = items[i];
+                        }
+                        if (!loggedUiADiagnostics)
+                        {
+                            Log("trigger: UIA desktop scan items=" + items.Count +
+                                " withHwnd=" + withHandle + " browserProcess=" + sameProcess +
+                                " visibleBrowserItems=" + visibleForProcess);
+                            loggedUiADiagnostics = true;
                         }
                     }
                     catch (Exception ex)
@@ -625,7 +680,7 @@ namespace YandexAliceHotkey
                     }
 
                     // Меню не появилось - повторяем Shift+F10 (надёжность доставки).
-                    if (!sawMenu && sends < 3 &&
+                    if (!probeWithoutSelection && !sawMenu && sends < 3 &&
                         (DateTime.UtcNow - lastSend).TotalMilliseconds > 900)
                     {
                         EnsureForeground(browserWindow);
@@ -638,30 +693,52 @@ namespace YandexAliceHotkey
 
                     if (sawMenu && (DateTime.UtcNow - firstMenuSeen).TotalMilliseconds > MENU_ITEM_GRACE_MS)
                     {
-                        Log("trigger: attempt " + attempt + "/" + MENU_ATTEMPTS +
+                        Log("trigger: attempt " + attempt + "/" + attemptLimit +
                             ": menu opened (" + lastMenuCount + " items) but the target item is missing: " + lastMenuNames);
                         SendEscape();
                         break;
                     }
                 }
 
-                if (attempt < MENU_ATTEMPTS)
+                if (attempt < attemptLimit)
                 {
                     Thread.Sleep(MENU_RETRY_DELAY_MS);
-                    Log("trigger: retrying with a fresh Shift+F10 (attempt " + (attempt + 1) + "/" + MENU_ATTEMPTS + ")");
+                    Log("trigger: retrying with a fresh Shift+F10 (attempt " + (attempt + 1) + "/" + attemptLimit + ")");
                     continue;
                 }
 
                 if (!sawMenu)
                 {
                     Log("trigger: context menu did not open (" + sends + " sends)");
+                    if (probeWithoutSelection) SendEscape();
                 }
                 else
                 {
-                    Log("trigger: target item not found after " + MENU_ATTEMPTS + " attempts");
+                    Log("trigger: target item not found after " + attemptLimit + " attempts");
                 }
                 return;
             }
+        }
+
+        // UIA children such as Chromium menu items commonly have HWND=0.
+        // Walk up to the containing menu/window and use that HWND to identify
+        // the owning browser process.
+        private static int FindOwningWindowHandle(AutomationElement element)
+        {
+            AutomationElement current = element;
+            for (int depth = 0; current != null && depth < 12; depth++)
+            {
+                try
+                {
+                    int handle = current.Current.NativeWindowHandle;
+                    if (handle != 0) return handle;
+                }
+                catch { }
+
+                try { current = TreeWalker.ControlViewWalker.GetParent(current); }
+                catch { return 0; }
+            }
+            return 0;
         }
 
         // Последовательность Shift+F10 с короткими паузами - так надёжнее,
@@ -776,3 +853,5 @@ namespace YandexAliceHotkey
         }
     }
 }
+
+
