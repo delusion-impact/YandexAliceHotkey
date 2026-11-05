@@ -1,11 +1,19 @@
-using System;
+﻿using System;
+using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
 using System.Runtime.InteropServices;
+using System.Runtime.InteropServices.WindowsRuntime;
 using System.Text;
 using System.Threading;
+using System.Drawing;
+using System.Drawing.Imaging;
 using System.Windows.Automation;
 using System.Windows.Automation.Text;
+using Windows.Globalization;
+using Windows.Graphics.Imaging;
+using Windows.Media.Ocr;
+using Windows.Storage.Streams;
 
 namespace YandexAliceHotkey
 {
@@ -22,6 +30,9 @@ namespace YandexAliceHotkey
         private const int WH_KEYBOARD_LL = 13;
         private const int VK_OEM_3 = 0xC0;   // ` (раскладка US) / ё (раскладка RU)
         private const int VK_SHIFT = 0x10;
+        private const int VK_CONTROL = 0x11;
+        private const int VK_LCONTROL = 0xA2;
+        private const int VK_RCONTROL = 0xA3;
         private const int VK_F10 = 0x79;
         private const int VK_ESCAPE = 0x1B;
 
@@ -32,6 +43,13 @@ namespace YandexAliceHotkey
         private const uint WM_QUIT = 0x0012;
 
         private const uint KEYEVENTF_KEYUP = 0x0002;
+        private const uint MOUSEEVENTF_LEFTDOWN = 0x0002;
+        private const uint MOUSEEVENTF_LEFTUP = 0x0004;
+        private const uint MOUSEEVENTF_MOVE = 0x0001;
+        private const uint MOUSEEVENTF_RIGHTDOWN = 0x0008;
+        private const uint MOUSEEVENTF_RIGHTUP = 0x0010;
+        private const uint MOUSEEVENTF_VIRTUALDESK = 0x4000;
+        private const uint MOUSEEVENTF_ABSOLUTE = 0x8000;
         private const uint PM_REMOVE = 0x0001;
         private const uint QS_ALLINPUT = 0x04FF;
 
@@ -42,7 +60,8 @@ namespace YandexAliceHotkey
         private const string BROWSER_PROCESS = "browser";
 
         // Версия сборки - для сопоставления строк лога с конкретным бинарником.
-        private const string APP_VERSION = "1.2.5";
+        private const string APP_VERSION = "2.5.11";
+        private const int MAX_PAGE_TEXT_CHARS = 12000;
 
         // Имена пунктов контекстного меню (локализация ru).
         private const string ITEM_SPEAK = "Озвучить Алисой";
@@ -71,6 +90,15 @@ namespace YandexAliceHotkey
         {
             public int x;
             public int y;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct RECT
+        {
+            public int left;
+            public int top;
+            public int right;
+            public int bottom;
         }
 
         [StructLayout(LayoutKind.Sequential)]
@@ -117,6 +145,17 @@ namespace YandexAliceHotkey
         [return: MarshalAs(UnmanagedType.Bool)]
         private static extern bool SetCursorPos(int X, int Y);
 
+        [DllImport("user32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool GetClientRect(IntPtr hWnd, out RECT lpRect);
+
+        [DllImport("user32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool ClientToScreen(IntPtr hWnd, ref POINT lpPoint);
+
+        [DllImport("user32.dll")]
+        private static extern int GetSystemMetrics(int nIndex);
+
         [DllImport("user32.dll")]
         private static extern void mouse_event(uint dwFlags, int dx, int dy, int dwData, UIntPtr dwExtraInfo);
 
@@ -141,16 +180,29 @@ namespace YandexAliceHotkey
         private static IntPtr s_hook;
         private static LowLevelKeyboardProc s_hookProc;
         private static int s_keyDown;             // 1, пока физически зажата клавиша
+        private static int s_ctrlDown;
+        private static int s_ctrlAloneCandidate;
         private static int s_busy;                // 1, пока идёт обработка
         private static long s_lastTriggerTicks;   // UtcNow.Ticks последнего запуска
         private static EventWaitHandle s_stopEvent;
         private static readonly object s_logLock = new object();
         private static string s_logPath;
+        private static bool s_profileOnly;
+        private static OcrEngine s_ocrEngine;
+        private static readonly object s_ocrLock = new object();
+
+        private sealed class OcrTextLine
+        {
+            public string Text;
+            public System.Windows.Rect Bounds;
+        }
 
         [STAThread]
         private static void Main(string[] args)
         {
             bool watch = false;
+            bool readPageOnce = false;
+            bool profilePageOnce = false;
             for (int i = 0; i < args.Length; i++)
             {
                 if (string.Equals(args[i], "--stop", StringComparison.OrdinalIgnoreCase))
@@ -169,6 +221,27 @@ namespace YandexAliceHotkey
                 {
                     watch = true;
                 }
+                if (string.Equals(args[i], "--read-page-once", StringComparison.OrdinalIgnoreCase))
+                {
+                    readPageOnce = true;
+                }
+                if (string.Equals(args[i], "--profile-page-once", StringComparison.OrdinalIgnoreCase))
+                {
+                    readPageOnce = true;
+                    profilePageOnce = true;
+                }
+            }
+
+            if (readPageOnce)
+            {
+                try { SetProcessDPIAware(); }
+                catch { }
+                s_logPath = Path.Combine(Path.GetTempPath(), "yandex_alice_hotkey.log");
+                s_profileOnly = profilePageOnce;
+                Log("manual test: reading current visible page once");
+                try { Decide(true); }
+                catch (Exception ex) { Log("manual test failed: " + ex.Message); }
+                return;
             }
 
             bool createdNew;
@@ -325,6 +398,25 @@ namespace YandexAliceHotkey
                     if (isDown || isUp)
                     {
                         KBDLLHOOKSTRUCT data = (KBDLLHOOKSTRUCT)Marshal.PtrToStructure(lParam, typeof(KBDLLHOOKSTRUCT));
+                        // Ignore keys synthesized by this app while selecting text or opening menus.
+                        if ((data.flags & 0x10) != 0) return CallNextHookEx(s_hook, nCode, wParam, lParam);
+                        bool isControl = data.vkCode == VK_CONTROL || data.vkCode == VK_LCONTROL || data.vkCode == VK_RCONTROL;
+                        if (isControl)
+                        {
+                            if (isDown && Interlocked.CompareExchange(ref s_ctrlDown, 1, 0) == 0)
+                            {
+                                Interlocked.Exchange(ref s_ctrlAloneCandidate, 1);
+                            }
+                            else if (isUp && Interlocked.Exchange(ref s_ctrlDown, 0) == 1)
+                            {
+                                if (Interlocked.Exchange(ref s_ctrlAloneCandidate, 0) == 1)
+                                    StartTrigger(true, "Ctrl");
+                            }
+                        }
+                        else if (isDown && Interlocked.CompareExchange(ref s_ctrlDown, 0, 0) == 1)
+                        {
+                            Interlocked.Exchange(ref s_ctrlAloneCandidate, 0);
+                        }
                         if (data.vkCode == VK_OEM_3)
                         {
                             if (isUp)
@@ -344,17 +436,12 @@ namespace YandexAliceHotkey
                                 catch { }
                                 bool debounce = InDebounce();
                                 bool yandex = IsYandexWindow(fg);
+                                bool bookMode = false;
                                 int busy = s_busy;
                                 Log("hook: VK_OEM_3 down, fg='" + fgClass + "' debounce=" + debounce +
+                                    " bookMode=" + bookMode +
                                     " yandex=" + yandex + " busy=" + busy);
-                                if (!debounce && yandex && busy == 0 &&
-                                    Interlocked.CompareExchange(ref s_busy, 1, 0) == 0)
-                                {
-                                    Thread worker = new Thread(DecideWorker);
-                                    worker.IsBackground = true;
-                                    worker.SetApartmentState(ApartmentState.STA);
-                                    worker.Start();
-                                }
+                                if (!debounce && yandex && busy == 0) StartTrigger(bookMode, "ё");
                             }
                         }
                     }
@@ -367,6 +454,19 @@ namespace YandexAliceHotkey
             return CallNextHookEx(s_hook, nCode, wParam, lParam);
         }
 
+        private static void StartTrigger(bool bookMode, string keyName)
+        {
+            IntPtr fg = GetForegroundWindow();
+            bool yandex = IsYandexWindow(fg);
+            bool debounce = InDebounce();
+            if (debounce || !yandex || Interlocked.CompareExchange(ref s_busy, 1, 0) != 0) return;
+            Log("hotkey: " + keyName + " bookMode=" + bookMode);
+            Thread worker = new Thread(delegate() { DecideWorker(bookMode); });
+            worker.IsBackground = true;
+            worker.SetApartmentState(ApartmentState.STA);
+            worker.Start();
+        }
+
         private static bool InDebounce()
         {
             long last = Interlocked.Read(ref s_lastTriggerTicks);
@@ -374,9 +474,9 @@ namespace YandexAliceHotkey
             return (DateTime.UtcNow.Ticks - last) < DEBOUNCE_MS * TimeSpan.TicksPerMillisecond;
         }
 
-        private static void DecideWorker()
+        private static void DecideWorker(bool bookMode)
         {
-            try { Decide(); }
+            try { Decide(bookMode); }
             catch (Exception ex) { Log("decide error: " + ex.Message); }
             finally { Interlocked.Exchange(ref s_busy, 0); }
         }
@@ -384,7 +484,7 @@ namespace YandexAliceHotkey
         // ------------------------------------------------------------------
         // Решение: есть ли выделенный текст на странице Яндекс Браузера.
         // ------------------------------------------------------------------
-        private static void Decide()
+        private static void Decide(bool bookMode)
         {
             IntPtr fg = GetForegroundWindow();
             if (!IsYandexWindow(fg))
@@ -407,6 +507,35 @@ namespace YandexAliceHotkey
             catch (Exception ex)
             {
                 Log("decide: process lookup failed: " + ex.Message);
+                return;
+            }
+
+            // Book mode does not need to inspect the current text selection.
+            // Go straight to the visible page area to avoid slow PDF TextPattern calls.
+            if (bookMode)
+            {
+                System.Windows.Point? contextPoint;
+                if (SelectCurrentPageByOcr(fg, out contextPoint))
+                {
+                    Log("decide: book mode selected the visible page area");
+                    if (s_profileOnly) Log("profile mode: skipped opening Alice menu");
+                    else Trigger(fg, null, false, contextPoint);
+                }
+                else
+                {
+                    Log("book mode: OCR did not find a safe page selection; falling back to UIA");
+                    AutomationElement focused = null;
+                    try { focused = AutomationElement.FocusedElement; }
+                    catch { }
+                    AutomationElement bookDocument = FindFocusedDocument(fg, focused);
+                    if (bookDocument != null && SelectDocumentText(bookDocument, fg, out contextPoint))
+                    {
+                        Log("decide: fallback UIA selected the visible page area");
+                        if (s_profileOnly) Log("profile mode: skipped opening Alice menu");
+                        else Trigger(fg, bookDocument, false, contextPoint);
+                    }
+                    else Log("decide: book mode could not select the visible page area");
+                }
                 return;
             }
 
@@ -489,6 +618,565 @@ namespace YandexAliceHotkey
             Trigger(fg, owner, false);
         }
 
+        private static AutomationElement FindFocusedDocument(IntPtr fg, AutomationElement focused)
+        {
+            AutomationElement current = focused;
+            for (int depth = 0; current != null && depth < 16; depth++)
+            {
+                if (IsDocumentElement(current)) return current;
+                try { current = TreeWalker.ControlViewWalker.GetParent(current); }
+                catch { break; }
+            }
+            try
+            {
+                AutomationElement root = AutomationElement.FromHandle(fg);
+                AutomationElementCollection docs = root.FindAll(TreeScope.Descendants,
+                    new PropertyCondition(AutomationElement.ControlTypeProperty, ControlType.Document));
+                AutomationElement bestDocument = null;
+                double bestArea = 0;
+                for (int i = 0; i < docs.Count; i++)
+                {
+                    try
+                    {
+                        if (docs[i].Current.HasKeyboardFocus) return docs[i];
+                        System.Windows.Rect bounds = docs[i].Current.BoundingRectangle;
+                        if (bounds.IsEmpty || bounds.Width <= 0 || bounds.Height <= 0) continue;
+                        object pattern;
+                        if (!docs[i].TryGetCurrentPattern(TextPattern.Pattern, out pattern)) continue;
+                        double area = bounds.Width * bounds.Height;
+                        if (area > bestArea)
+                        {
+                            bestDocument = docs[i];
+                            bestArea = area;
+                        }
+                    }
+                    catch { }
+                }
+                if (bestDocument != null) Log("book mode: chose visible document by viewport area=" + bestArea);
+                return bestDocument;
+            }
+            catch (Exception ex) { Log("book mode: document scan failed: " + ex.Message); }
+            return null;
+        }
+
+        private static bool SelectCurrentPageByOcr(IntPtr browserWindow, out System.Windows.Point? contextPoint)
+        {
+            contextPoint = null;
+            Stopwatch total = Stopwatch.StartNew();
+            Stopwatch phase = Stopwatch.StartNew();
+            System.Windows.Rect client;
+            if (!GetClientScreenBounds(browserWindow, out client) || client.Width < 400 || client.Height < 400)
+            {
+                Log("book OCR: browser client viewport unavailable or too small");
+                return false;
+            }
+
+            try
+            {
+                using (Bitmap bitmap = new Bitmap((int)Math.Round(client.Width), (int)Math.Round(client.Height), PixelFormat.Format32bppArgb))
+                {
+                    using (Graphics graphics = Graphics.FromImage(bitmap))
+                    {
+                        graphics.CopyFromScreen((int)Math.Round(client.Left), (int)Math.Round(client.Top),
+                            0, 0, bitmap.Size, CopyPixelOperation.SourceCopy);
+                    }
+                    Log("book OCR timing: viewport capture elapsedMs=" + phase.ElapsedMilliseconds);
+                    phase.Restart();
+
+                    System.Windows.Rect pageBounds;
+                    if (!TryFindWhitePageBounds(bitmap, out pageBounds))
+                    {
+                        Log("book OCR: could not locate the visible white PDF page");
+                        return false;
+                    }
+                    Log("book OCR timing: page bounds=" + pageBounds + " elapsedMs=" + phase.ElapsedMilliseconds);
+                    phase.Restart();
+
+                    OcrEngine engine = GetOcrEngine();
+                    if (engine == null)
+                    {
+                        Log("book OCR: Russian OCR language is unavailable");
+                        return false;
+                    }
+                    using (MemoryStream stream = new MemoryStream())
+                    {
+                        bitmap.Save(stream, ImageFormat.Png);
+                        stream.Position = 0;
+                        IRandomAccessStream randomAccess = stream.AsRandomAccessStream();
+                        BitmapDecoder decoder = BitmapDecoder.CreateAsync(randomAccess).AsTask().GetAwaiter().GetResult();
+                        SoftwareBitmap softwareBitmap = decoder.GetSoftwareBitmapAsync().AsTask().GetAwaiter().GetResult();
+                        OcrResult result = engine.RecognizeAsync(softwareBitmap).AsTask().GetAwaiter().GetResult();
+                        Log("book OCR timing: recognize lines=" + result.Lines.Count + " elapsedMs=" + phase.ElapsedMilliseconds);
+
+                        List<OcrTextLine> lines = GetOcrPageLines(result, pageBounds);
+                        if (lines.Count < 2)
+                        {
+                            Log("book OCR: too few page text lines; lines=" + lines.Count);
+                            softwareBitmap.Dispose();
+                            randomAccess.Dispose();
+                            return false;
+                        }
+
+                        int first = 0;
+                        int last = lines.Count - 1;
+                        RemoveRunningHeader(lines, pageBounds, ref first);
+                        if (last > first && IsPageNumberOnly(lines[last].Text))
+                        {
+                            Log("book OCR: skipped footer page number='" + PreviewText(lines[last].Text, 32) + "'");
+                            last--;
+                        }
+                        if (last <= first)
+                        {
+                            Log("book OCR: no body text remains after header filtering");
+                            softwareBitmap.Dispose();
+                            randomAccess.Dispose();
+                            return false;
+                        }
+
+                        OcrTextLine firstLine = lines[first];
+                        OcrTextLine lastLine = lines[last];
+                        double endPadding = Math.Max(8, lastLine.Bounds.Height);
+                        System.Windows.Point start = new System.Windows.Point(
+                            client.Left + firstLine.Bounds.Left + Math.Min(3, Math.Max(1, firstLine.Bounds.Width * 0.02)),
+                            client.Top + firstLine.Bounds.Top + firstLine.Bounds.Height / 2);
+                        System.Windows.Point end = new System.Windows.Point(
+                            Math.Min(client.Right - 2, client.Left + lastLine.Bounds.Right + endPadding),
+                            client.Top + lastLine.Bounds.Top + lastLine.Bounds.Height / 2);
+                        System.Windows.Point menuPoint = new System.Windows.Point(
+                            client.Left + lastLine.Bounds.Left + lastLine.Bounds.Width / 2,
+                            client.Top + lastLine.Bounds.Top + lastLine.Bounds.Height / 2);
+                        if (!client.Contains(start) || !client.Contains(end) || end.Y <= start.Y)
+                        {
+                            Log("book OCR: refused invalid text endpoints start=" + start + " end=" + end);
+                            softwareBitmap.Dispose();
+                            randomAccess.Dispose();
+                            return false;
+                        }
+
+                        phase.Restart();
+                        bool dragged = DragSelectText(start, end, client);
+                        Log("book OCR timing: drag elapsedMs=" + phase.ElapsedMilliseconds +
+                            " totalElapsedMs=" + total.ElapsedMilliseconds);
+                        if (dragged)
+                        {
+                            contextPoint = client.Contains(menuPoint) ? menuPoint : end;
+                            Log("book OCR: selected text body, lines=" + lines.Count +
+                                " first='" + PreviewText(firstLine.Text, 72) + "' last='" + PreviewText(lastLine.Text, 72) +
+                                " start=" + start + " end=" + end + " menuPoint=" + contextPoint.Value);
+                        }
+                        softwareBitmap.Dispose();
+                        randomAccess.Dispose();
+                        return dragged;
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Log("book OCR failed: " + ex.Message);
+                return false;
+            }
+        }
+
+        private static OcrEngine GetOcrEngine()
+        {
+            lock (s_ocrLock)
+            {
+                if (s_ocrEngine != null) return s_ocrEngine;
+                try
+                {
+                    s_ocrEngine = OcrEngine.TryCreateFromLanguage(new Language("ru-RU"));
+                    if (s_ocrEngine == null) s_ocrEngine = OcrEngine.TryCreateFromUserProfileLanguages();
+                }
+                catch (Exception ex) { Log("book OCR engine initialization failed: " + ex.Message); }
+                return s_ocrEngine;
+            }
+        }
+
+        private static bool TryFindWhitePageBounds(Bitmap bitmap, out System.Windows.Rect pageBounds)
+        {
+            pageBounds = System.Windows.Rect.Empty;
+            const int scale = 4;
+            int w = Math.Max(1, bitmap.Width / scale);
+            int h = Math.Max(1, bitmap.Height / scale);
+            int minY = Math.Max(0, (int)(h * 0.14)); // skip browser tabs and the PDF toolbar
+            bool[] white = new bool[w * h];
+            for (int y = minY; y < h; y++)
+            {
+                for (int x = 0; x < w; x++)
+                {
+                    Color c = bitmap.GetPixel(Math.Min(bitmap.Width - 1, x * scale + scale / 2),
+                        Math.Min(bitmap.Height - 1, y * scale + scale / 2));
+                    white[y * w + x] = c.R >= 248 && c.G >= 248 && c.B >= 248;
+                }
+            }
+
+            bool[] visited = new bool[white.Length];
+            int[] queue = new int[white.Length];
+            int bestCount = 0, bestLeft = 0, bestTop = 0, bestRight = 0, bestBottom = 0;
+            for (int i = minY * w; i < white.Length; i++)
+            {
+                if (!white[i] || visited[i]) continue;
+                int head = 0, tail = 0;
+                queue[tail++] = i;
+                visited[i] = true;
+                int left = w, top = h, right = 0, bottom = 0;
+                while (head < tail)
+                {
+                    int index = queue[head++];
+                    int x = index % w, y = index / w;
+                    if (x < left) left = x;
+                    if (x > right) right = x;
+                    if (y < top) top = y;
+                    if (y > bottom) bottom = y;
+                    int n;
+                    if (x > 0) { n = index - 1; if (white[n] && !visited[n]) { visited[n] = true; queue[tail++] = n; } }
+                    if (x + 1 < w) { n = index + 1; if (white[n] && !visited[n]) { visited[n] = true; queue[tail++] = n; } }
+                    if (y > 0) { n = index - w; if (white[n] && !visited[n]) { visited[n] = true; queue[tail++] = n; } }
+                    if (y + 1 < h) { n = index + w; if (white[n] && !visited[n]) { visited[n] = true; queue[tail++] = n; } }
+                }
+                if (tail > bestCount)
+                {
+                    bestCount = tail;
+                    bestLeft = left; bestTop = top; bestRight = right; bestBottom = bottom;
+                }
+            }
+
+            int boxWidth = bestRight - bestLeft + 1;
+            int boxHeight = bestBottom - bestTop + 1;
+            if (bestCount < white.Length * 0.08 || boxWidth < w * 0.35 || boxHeight < h * 0.45) return false;
+            pageBounds = new System.Windows.Rect(bestLeft * scale, bestTop * scale,
+                Math.Min(bitmap.Width - bestLeft * scale, boxWidth * scale),
+                Math.Min(bitmap.Height - bestTop * scale, boxHeight * scale));
+            return true;
+        }
+
+        private static List<OcrTextLine> GetOcrPageLines(OcrResult result, System.Windows.Rect pageBounds)
+        {
+            List<OcrTextLine> lines = new List<OcrTextLine>();
+            foreach (OcrLine line in result.Lines)
+            {
+                if (line.Words == null || line.Words.Count == 0) continue;
+                double left = double.MaxValue, top = double.MaxValue, right = double.MinValue, bottom = double.MinValue;
+                for (int i = 0; i < line.Words.Count; i++)
+                {
+                    Windows.Foundation.Rect r = line.Words[i].BoundingRect;
+                    left = Math.Min(left, r.X); top = Math.Min(top, r.Y);
+                    right = Math.Max(right, r.X + r.Width); bottom = Math.Max(bottom, r.Y + r.Height);
+                }
+                System.Windows.Rect bounds = new System.Windows.Rect(left, top, right - left, bottom - top);
+                if (bounds.Width < 3 || bounds.Height < 4 || bounds.Height > 100) continue;
+                if (bounds.Right < pageBounds.Left || bounds.Left > pageBounds.Right ||
+                    bounds.Bottom < pageBounds.Top || bounds.Top > pageBounds.Bottom) continue;
+                lines.Add(new OcrTextLine { Text = line.Text, Bounds = bounds });
+            }
+            lines.Sort(delegate(OcrTextLine a, OcrTextLine b)
+            {
+                double dy = a.Bounds.Top - b.Bounds.Top;
+                return Math.Abs(dy) < 6 ? a.Bounds.Left.CompareTo(b.Bounds.Left) : dy.CompareTo(0);
+            });
+            return lines;
+        }
+
+        private static void RemoveRunningHeader(List<OcrTextLine> lines, System.Windows.Rect pageBounds, ref int first)
+        {
+            if (lines.Count <= 1) return;
+            string text = (lines[0].Text ?? string.Empty).Trim();
+            double firstCenter = lines[0].Bounds.Top + lines[0].Bounds.Height / 2;
+            bool topOfPage = firstCenter <= pageBounds.Top + pageBounds.Height * 0.10;
+            if (topOfPage && (IsPageNumberAndRunningHeader(text) ||
+                IsRunningHeaderWithTrailingPageNumber(text) || IsAnyHeaderWithTrailingFolio(text)))
+            {
+                Log("book OCR: skipped top page header='" + PreviewText(text, 90) + "'");
+                first++;
+                return;
+            }
+
+            // On facing book pages the folio can sit on either side of the
+            // running title. OCR may return them as separate lines with the
+            // same baseline; identify the whole top row by geometry, not by
+            // assuming the page number comes before the title.
+            int sameRowEnd = 0;
+            bool hasFolio = false;
+            StringBuilder topRow = new StringBuilder();
+            for (int i = 0; i < lines.Count && i < 5 && (i == 0 || SameTextRow(lines[0], lines[i])); i++)
+            {
+                sameRowEnd = i;
+                if (IsPageNumberOnly(lines[i].Text)) hasFolio = true;
+                if (topRow.Length > 0) topRow.Append(" | ");
+                topRow.Append(lines[i].Text);
+            }
+            if (hasFolio && topOfPage)
+            {
+                first = sameRowEnd + 1;
+                Log("book OCR: skipped top row with folio='" + PreviewText(topRow.ToString(), 100) + "'");
+                return;
+            }
+            double topInset = lines[0].Bounds.Top - pageBounds.Top;
+            bool shortRightHeader = text.Length <= 60 &&
+                lines[0].Bounds.Left >= pageBounds.Left + pageBounds.Width * 0.55;
+            if (topOfPage && topInset <= pageBounds.Height * 0.09 && shortRightHeader)
+            {
+                first++;
+                Log("book OCR: skipped short right-aligned top header='" + PreviewText(text, 72) +
+                    "' yOffset=" + topInset.ToString("F1") + " bounds=" + lines[0].Bounds);
+                return;
+            }
+            if (topOfPage && topInset <= pageBounds.Height * 0.035 && lines[0].Text.Trim().Length <= 100)
+            {
+                first++;
+                Log("book OCR: skipped top-margin header by position='" + PreviewText(text, 72) +
+                    "' yOffset=" + topInset.ToString("F1"));
+                return;
+            }
+            if (topOfPage)
+                Log("book OCR: top row kept; no same-row folio found text='" + PreviewText(topRow.ToString(), 96) +
+                    "' yOffset=" + topInset.ToString("F1"));
+            if (lines.Count > 1 && IsPageNumberOnly(text) && SameTextRow(lines[0], lines[1]) && IsRunningChapterHeader(lines[1].Text))
+            {
+                Log("book OCR: skipped page number and running header='" + PreviewText(text + " " + lines[1].Text, 90) + "'");
+                first += 2;
+                return;
+            }
+            if (lines.Count > 1 && IsRunningChapterHeader(text) && SameTextRow(lines[0], lines[1]) && IsPageNumberOnly(lines[1].Text))
+            {
+                Log("book OCR: skipped running header and page number='" + PreviewText(text + " " + lines[1].Text, 90) + "'");
+                first += 2;
+                return;
+            }
+            if (IsPageNumberOnly(text))
+            {
+                Log("book OCR: skipped standalone page number='" + PreviewText(text, 32) + "'");
+                first++;
+            }
+        }
+
+        private static bool SameTextRow(OcrTextLine a, OcrTextLine b)
+        {
+            double centerA = a.Bounds.Top + a.Bounds.Height / 2;
+            double centerB = b.Bounds.Top + b.Bounds.Height / 2;
+            return Math.Abs(centerA - centerB) <= Math.Max(12, Math.Max(a.Bounds.Height, b.Bounds.Height) * 1.5);
+        }
+
+        private static bool IsRunningHeaderWithTrailingPageNumber(string text)
+        {
+            string s = (text ?? string.Empty).Trim();
+            int lastSpace = s.LastIndexOfAny(new char[] { ' ', '\t', '\u00A0', '\u2003' });
+            return lastSpace >= 0 && IsPageNumberOnly(s.Substring(lastSpace + 1)) &&
+                IsRunningChapterHeader(s.Substring(0, lastSpace).TrimEnd());
+        }
+
+        private static bool IsAnyHeaderWithTrailingFolio(string text)
+        {
+            string s = (text ?? string.Empty).Trim();
+            int lastSpace = s.LastIndexOfAny(new char[] { ' ', '\t', '\u00A0', '\u2003' });
+            if (lastSpace < 0) return false;
+            string trailing = s.Substring(lastSpace + 1);
+            return IsPageNumberOnly(trailing) && lastSpace > 0 &&
+                s.Substring(0, lastSpace).Trim().Length > 0;
+        }
+
+        private static bool SelectDocumentText(AutomationElement document, IntPtr browserWindow, out System.Windows.Point? contextPoint)
+        {
+            contextPoint = null;
+            Stopwatch total = Stopwatch.StartNew();
+            Stopwatch phase = Stopwatch.StartNew();
+            try
+            {
+                System.Windows.Rect client;
+                if (!GetClientScreenBounds(browserWindow, out client) || client.Width < 400 || client.Height < 400)
+                {
+                    Log("book mode: browser client viewport unavailable or too small");
+                    return false;
+                }
+
+                object pattern;
+                if (!document.TryGetCurrentPattern(TextPattern.Pattern, out pattern))
+                {
+                    Log("book mode: visible page document has no UIA TextPattern");
+                    return false;
+                }
+
+                TextPattern textPattern = (TextPattern)pattern;
+                TextPatternRange[] visibleRanges = textPattern.GetVisibleRanges();
+                Log("book timing: GetVisibleRanges count=" + (visibleRanges == null ? 0 : visibleRanges.Length) +
+                    " elapsedMs=" + phase.ElapsedMilliseconds);
+                if (visibleRanges == null || visibleRanges.Length == 0)
+                {
+                    Log("book mode: UIA returned no visible text ranges");
+                    return false;
+                }
+
+                int firstIndex = 0;
+                int lastIndex = visibleRanges.Length - 1;
+                string firstText = visibleRanges[firstIndex].GetText(300).Trim();
+                string lastText = visibleRanges[lastIndex].GetText(80).Trim();
+                bool firstIsPageNumber = IsPageNumberOnly(firstText);
+                if (IsPageNumberAndRunningHeader(firstText))
+                {
+                    firstIndex++;
+                    Log("book mode: skipped page number and running header='" + PreviewText(firstText, 80) + "'");
+                }
+                else if (firstIsPageNumber && firstIndex + 1 < lastIndex)
+                {
+                    string nextText = visibleRanges[firstIndex + 1].GetText(180).Trim();
+                    if (IsRunningChapterHeader(nextText))
+                    {
+                        firstIndex += 2;
+                        Log("book mode: skipped page number and running header='" + PreviewText(nextText, 80) + "'");
+                    }
+                    else
+                    {
+                        firstIndex++;
+                        Log("book mode: skipped standalone page number='" + firstText + "'");
+                    }
+                }
+                else if (IsRunningChapterHeader(firstText))
+                {
+                    firstIndex++;
+                    Log("book mode: skipped running header='" + PreviewText(firstText, 80) + "'");
+                }
+                if (IsPageNumberOnly(lastText) && lastIndex > firstIndex)
+                {
+                    lastIndex--;
+                    Log("book mode: skipped trailing page number='" + lastText + "'");
+                }
+                if (firstIndex >= lastIndex)
+                {
+                    Log("book mode: not enough visible text ranges after header filtering");
+                    return false;
+                }
+
+                phase.Restart();
+                System.Windows.Rect[] firstRects = visibleRanges[firstIndex].GetBoundingRectangles();
+                System.Windows.Rect[] lastRects = visibleRanges[lastIndex].GetBoundingRectangles();
+                Log("book timing: endpoint bounds elapsedMs=" + phase.ElapsedMilliseconds);
+                System.Windows.Point dragStart, dragEnd;
+                if (!TryGetVisibleTextDragPoints(firstRects, lastRects, client, out dragStart, out dragEnd))
+                {
+                    Log("book mode: UIA endpoint ranges have no safe text bounds; ranges=" + visibleRanges.Length);
+                    return false;
+                }
+
+                phase.Restart();
+                if (!DragSelectText(dragStart, dragEnd, client)) return false;
+                Log("book timing: mouse selection elapsedMs=" + phase.ElapsedMilliseconds);
+                contextPoint = dragEnd;
+                Log("book mode: dragged along visible text bounds, ranges=" + visibleRanges.Length +
+                    " first='" + PreviewText(firstText, 80) + "' last='" + PreviewText(lastText, 80) +
+                    "' start=" + dragStart + " end=" + dragEnd + " totalElapsedMs=" + total.ElapsedMilliseconds);
+                return true;
+            }
+            catch (Exception ex) { Log("book mode: UIA visible-text selection failed: " + ex.Message); return false; }
+        }
+
+        private static string PreviewText(string text, int maxLength)
+        {
+            string preview = (text ?? string.Empty).Replace("\r", " ").Replace("\n", " ").Trim();
+            if (preview.Length > maxLength) preview = preview.Substring(0, maxLength);
+            return preview;
+        }
+
+        private static bool IsPageNumberOnly(string text)
+        {
+            if (string.IsNullOrWhiteSpace(text)) return false;
+            string s = text.Trim();
+            if (s.Length == 0 || s.Length > 4) return false;
+            for (int i = 0; i < s.Length; i++) if (!char.IsDigit(s[i])) return false;
+            return true;
+        }
+
+        private static bool IsPageNumberAndRunningHeader(string text)
+        {
+            string s = (text ?? string.Empty).TrimStart();
+            int i = 0;
+            while (i < s.Length && char.IsDigit(s[i])) i++;
+            if (i == 0 || i > 4 || i >= s.Length || !char.IsWhiteSpace(s[i])) return false;
+            return IsRunningChapterHeader(s.Substring(i).TrimStart());
+        }
+
+        private static bool IsRunningChapterHeader(string text)
+        {
+            string s = (text ?? string.Empty).TrimStart();
+            return s.StartsWith("Глава", StringComparison.OrdinalIgnoreCase) ||
+                s.StartsWith("Chapter", StringComparison.OrdinalIgnoreCase) ||
+                s.StartsWith("Часть", StringComparison.OrdinalIgnoreCase) ||
+                s.StartsWith("Part", StringComparison.OrdinalIgnoreCase);
+        }
+
+        private static bool TryGetVisibleTextPoint(System.Windows.Rect[] rectangles, System.Windows.Rect client, out System.Windows.Point point)
+        {
+            point = new System.Windows.Point();
+            if (rectangles == null || rectangles.Length == 0) return false;
+            double bestArea = 0;
+            for (int i = 0; i < rectangles.Length; i++)
+            {
+                System.Windows.Rect r = rectangles[i];
+                if (r.IsEmpty || r.Width <= 0 || r.Height <= 0) continue;
+                System.Windows.Rect clipped = System.Windows.Rect.Intersect(r, client);
+                double area = clipped.IsEmpty ? 0 : clipped.Width * clipped.Height;
+                if (area > bestArea)
+                {
+                    bestArea = area;
+                    point = new System.Windows.Point(clipped.Left + clipped.Width / 2, clipped.Top + clipped.Height / 2);
+                }
+            }
+            return bestArea > 0 && client.Contains(point);
+        }
+
+        private static bool TryGetVisibleTextDragPoints(System.Windows.Rect[] firstRectangles,
+            System.Windows.Rect[] lastRectangles, System.Windows.Rect client,
+            out System.Windows.Point start, out System.Windows.Point end)
+        {
+            start = new System.Windows.Point();
+            end = new System.Windows.Point();
+            if (firstRectangles == null || firstRectangles.Length == 0 ||
+                lastRectangles == null || lastRectangles.Length == 0) return false;
+
+            System.Windows.Rect first = System.Windows.Rect.Empty;
+            System.Windows.Rect last = System.Windows.Rect.Empty;
+            for (int i = 0; i < firstRectangles.Length; i++)
+            {
+                System.Windows.Rect r = firstRectangles[i];
+                if (r.IsEmpty || r.Width < 3 || r.Height < 4 || r.Height > 100) continue;
+                System.Windows.Rect clipped = System.Windows.Rect.Intersect(r, client);
+                if (clipped.IsEmpty || clipped.Width < 3 || clipped.Height < 4) continue;
+                first = clipped;
+                break;
+            }
+            for (int i = lastRectangles.Length - 1; i >= 0; i--)
+            {
+                System.Windows.Rect r = lastRectangles[i];
+                if (r.IsEmpty || r.Width < 3 || r.Height < 4 || r.Height > 100) continue;
+                System.Windows.Rect clipped = System.Windows.Rect.Intersect(r, client);
+                if (clipped.IsEmpty || clipped.Width < 3 || clipped.Height < 4) continue;
+                last = clipped;
+                break;
+            }
+            if (first.IsEmpty || last.IsEmpty) return false;
+
+            double startInset = Math.Min(3, Math.Max(1, first.Width * 0.03));
+            double endInset = Math.Min(3, Math.Max(1, last.Width * 0.03));
+            start = new System.Windows.Point(first.Left + startInset, first.Top + first.Height / 2);
+            end = new System.Windows.Point(last.Right - endInset, last.Top + last.Height / 2);
+            return client.Contains(start) && client.Contains(end) &&
+                (end.Y > start.Y || (Math.Abs(end.Y - start.Y) < 2 && end.X > start.X));
+        }
+
+        private static bool GetClientScreenBounds(IntPtr hwnd, out System.Windows.Rect bounds)
+        {
+            bounds = System.Windows.Rect.Empty;
+            RECT client;
+            if (hwnd == IntPtr.Zero || !GetClientRect(hwnd, out client)) return false;
+            POINT topLeft = new POINT();
+            POINT bottomRight = new POINT();
+            bottomRight.x = client.right;
+            bottomRight.y = client.bottom;
+            if (!ClientToScreen(hwnd, ref topLeft) || !ClientToScreen(hwnd, ref bottomRight)) return false;
+            bounds = new System.Windows.Rect(topLeft.x, topLeft.y,
+                bottomRight.x - topLeft.x, bottomRight.y - topLeft.y);
+            return !bounds.IsEmpty;
+        }
+
         private static bool IsDocumentElement(AutomationElement element)
         {
             if (element == null) return false;
@@ -548,7 +1236,8 @@ namespace YandexAliceHotkey
         // ------------------------------------------------------------------
         // Открыть контекстное меню и активировать пункт озвучки.
         // ------------------------------------------------------------------
-        private static void Trigger(IntPtr browserWindow, AutomationElement owner, bool probeWithoutSelection)
+        private static void Trigger(IntPtr browserWindow, AutomationElement owner, bool probeWithoutSelection,
+            System.Windows.Point? contextPoint = null)
         {
             Interlocked.Exchange(ref s_lastTriggerTicks, DateTime.UtcNow.Ticks);
 
@@ -564,14 +1253,16 @@ namespace YandexAliceHotkey
             // страницы без выделения в PDF-просмотрщике) - в нём нет пункта
             // Алисы. Поэтому не сдаёмся после первой попытки, а закрываем
             // меню и пробуем ещё раз с полным повтором (FocusOwner + Shift+F10).
-            int attemptLimit = probeWithoutSelection ? 1 : MENU_ATTEMPTS;
+            int attemptLimit = (probeWithoutSelection || contextPoint.HasValue) ? 1 : MENU_ATTEMPTS;
             int timeoutMs = probeWithoutSelection ? 2200 : MENU_TIMEOUT_MS;
+            bool restartedPlayback = false;
             for (int attempt = 1; attempt <= attemptLimit; attempt++)
             {
                 // Shift+F10 открывает контекстное меню для текущего выделения.
                 EnsureForeground(browserWindow);
-                FocusOwner(owner);
-                SendContextKeys();
+                if (!contextPoint.HasValue) FocusOwner(owner);
+                if (contextPoint.HasValue) SendRightClick(browserWindow, contextPoint.Value);
+                else SendContextKeys();
 
                 DateTime start = DateTime.UtcNow;
                 DateTime lastSend = start;
@@ -674,18 +1365,41 @@ namespace YandexAliceHotkey
                             try { name = target.Current.Name; }
                             catch { }
                             Log("trigger: invoking '" + name + "'");
-                            if (InvokeItem(target)) return;
+                            if (stop != null && contextPoint.HasValue && !restartedPlayback)
+                            {
+                                if (InvokeItem(stop))
+                                {
+                                    restartedPlayback = true;
+                                    Log("trigger: stopped previous playback; starting the selected page");
+                                    Thread.Sleep(500);
+                                    EnsureForeground(browserWindow);
+                                    SendRightClick(browserWindow, contextPoint.Value);
+                                    sawMenu = false;
+                                    firstMenuSeen = DateTime.MinValue;
+                                    lastSend = DateTime.UtcNow;
+                                    sends = 1;
+                                    continue;
+                                }
+                            }
+                            else if (restartedPlayback && stop != null)
+                            {
+                                // Wait for the PDF menu to switch from Stop to Speak.
+                                Thread.Sleep(250);
+                                continue;
+                            }
+                            else if (InvokeItem(target)) return;
                             Log("trigger: invoke failed");
                         }
                     }
 
                     // Меню не появилось - повторяем Shift+F10 (надёжность доставки).
-                    if (!probeWithoutSelection && !sawMenu && sends < 3 &&
+                    if (!probeWithoutSelection && !contextPoint.HasValue && !sawMenu && sends < 3 &&
                         (DateTime.UtcNow - lastSend).TotalMilliseconds > 900)
                     {
                         EnsureForeground(browserWindow);
-                        FocusOwner(owner);
-                        SendContextKeys();
+                        if (!contextPoint.HasValue) FocusOwner(owner);
+                        if (contextPoint.HasValue) SendRightClick(browserWindow, contextPoint.Value);
+                        else SendContextKeys();
                         sends++;
                         lastSend = DateTime.UtcNow;
                         Log("trigger: menu not seen yet, Shift+F10 resend #" + sends);
@@ -752,6 +1466,67 @@ namespace YandexAliceHotkey
             keybd_event((byte)VK_F10, 0, KEYEVENTF_KEYUP, NO_EXTRA);
             Thread.Sleep(15);
             keybd_event((byte)VK_SHIFT, 0, KEYEVENTF_KEYUP, NO_EXTRA);
+        }
+
+        private static void SendRightClick(IntPtr browserWindow, System.Windows.Point point)
+        {
+            System.Windows.Rect client;
+            if (!GetClientScreenBounds(browserWindow, out client) || !client.Contains(point))
+            {
+                Log("trigger: refused right-click outside browser client bounds at " + point);
+                return;
+            }
+            int x = (int)Math.Round(point.X);
+            int y = (int)Math.Round(point.Y);
+            SetCursorPos(x, y);
+            Thread.Sleep(60);
+            mouse_event(MOUSEEVENTF_RIGHTDOWN, 0, 0, 0, NO_EXTRA);
+            Thread.Sleep(25);
+            mouse_event(MOUSEEVENTF_RIGHTUP, 0, 0, 0, NO_EXTRA);
+        }
+
+        private static bool DragSelectText(System.Windows.Point start, System.Windows.Point end, System.Windows.Rect client)
+        {
+            if (!client.Contains(start) || !client.Contains(end))
+            {
+                Log("book mode: refused drag outside browser client bounds");
+                return false;
+            }
+            SetCursorPos((int)Math.Round(start.X), (int)Math.Round(start.Y));
+            Thread.Sleep(80);
+            mouse_event(MOUSEEVENTF_LEFTDOWN, 0, 0, 0, NO_EXTRA);
+            const int steps = 80;
+            int virtualLeft = GetSystemMetrics(76);
+            int virtualTop = GetSystemMetrics(77);
+            int virtualWidth = GetSystemMetrics(78);
+            int virtualHeight = GetSystemMetrics(79);
+            if (virtualWidth <= 1 || virtualHeight <= 1)
+            {
+                mouse_event(MOUSEEVENTF_LEFTUP, 0, 0, 0, NO_EXTRA);
+                Log("book mode: invalid virtual screen dimensions");
+                return false;
+            }
+            for (int i = 1; i <= steps; i++)
+            {
+                double t = (double)i / steps;
+                System.Windows.Point p = new System.Windows.Point(
+                    start.X + (end.X - start.X) * t,
+                    start.Y + (end.Y - start.Y) * t);
+                if (!client.Contains(p))
+                {
+                    mouse_event(MOUSEEVENTF_LEFTUP, 0, 0, 0, NO_EXTRA);
+                    Log("book mode: cancelled drag at a point outside browser client bounds");
+                    return false;
+                }
+                int absoluteX = (int)Math.Round((p.X - virtualLeft) * 65535.0 / (virtualWidth - 1));
+                int absoluteY = (int)Math.Round((p.Y - virtualTop) * 65535.0 / (virtualHeight - 1));
+                mouse_event(MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK,
+                    absoluteX, absoluteY, 0, NO_EXTRA);
+                Thread.Sleep(15);
+            }
+            Thread.Sleep(80);
+            mouse_event(MOUSEEVENTF_LEFTUP, 0, 0, 0, NO_EXTRA);
+            return true;
         }
 
         private static void EnsureForeground(IntPtr hwnd)
@@ -853,5 +1628,4 @@ namespace YandexAliceHotkey
         }
     }
 }
-
 
